@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title><%= title %></title>
+    <style>
+      body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        line-height: 1.6;
+        color: #333;
+        margin: 0;
+        padding: 0;
+        background-color: #f4f7f9;
+      }
+      .container {
+        max-width: 600px;
+        margin: 20px auto;
+        background: #ffffff;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.05);
+      }
+      .header {
+        background: linear-gradient(135deg, #2c5aa0 0%, #1e3c72 100%);
+        color: #ffffff;
+        padding: 40px 20px;
+        text-align: center;
+      }
+      .header h1 {
+        margin: 0;
+        font-size: 28px;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+      }
+      .content {
+        padding: 40px 30px;
+        background: #ffffff;
+      }
+      .content h2 {
+        color: #1e3c72;
+        margin-top: 0;
+        font-size: 22px;
+      }
+      .content p {
+        margin-bottom: 20px;
+        color: #555;
+        font-size: 16px;
+      }
+      .footer {
+        background: #f9f9f9;
+        padding: 20px;
+        text-align: center;
+        color: #888;
+        font-size: 13px;
+        border-top: 1px solid #eee;
+      }
+      .footer a {
+        color: #2c5aa0;
+        text-decoration: none;
+      }
+      .btn {
+        display: inline-block;
+        padding: 12px 25px;
+        background-color: #2c5aa0;
+        color: #ffffff !important;
+        text-decoration: none;
+        border-radius: 6px;
+        font-weight: bold;
+        margin-top: 10px;
+      }
+      .otp-box {
+        background: #f0f4f8;
+        padding: 20px;
+        border-radius: 8px;
+        text-align: center;
+        font-size: 32px;
+        font-weight: bold;
+        letter-spacing: 5px;
+        color: #1e3c72;
+        margin: 20px 0;
+        border: 1px dashed #2c5aa0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>WECURE</h1>
+      </div>
+      <div class="content">
+        <h2><%= title %></h2>
+        <div class="main-text"><%- content %></div>
+      </div>
+      <div class="footer">
+        <p>&copy; <%= year %> WECURE. All rights reserved.</p>
+        <p>
+          <a href="#">Privacy Policy</a> |
+          <a href="#">Support</a>
+        </p>
+      </div>
+    </div>
+  </body>
+</html>
