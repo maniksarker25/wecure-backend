@@ -148,6 +148,55 @@ describe('AuthService', () => {
       expect(result.isProfileComplete).toBe(false);
     });
 
+    it('creates the doctor document at signup with the national doctor id', async () => {
+      const createdUser = {
+        _id: 'new-user',
+        name: 'Ada Lovelace',
+        email: 'new@example.com',
+        role: Role.DOCTOR,
+      };
+      (usersService.findByEmail as jest.Mock).mockResolvedValue(null);
+      (usersService as any).userModel = {
+        findOneAndUpdate: jest.fn().mockResolvedValue(createdUser),
+      };
+      doctorModel.findOne.mockImplementation((query: any) => {
+        if (query?.mdcnRegistrationNumber) {
+          return { select: jest.fn().mockResolvedValue(null) };
+        }
+        return Promise.resolve(null);
+      });
+      doctorModel.create.mockResolvedValue({
+        _id: 'new-doctor',
+        userId: createdUser._id,
+        mdcnRegistrationNumber: '555555',
+        verificationStatus: 'INCOMPLETE',
+        isProfileComplete: false,
+        isVerified: false,
+      });
+
+      const result = await service.sendRegistrationOtp({
+        name: 'Ada Lovelace',
+        email: 'new@example.com',
+        password: 'password123',
+        role: Role.DOCTOR,
+        doctorId: '555555',
+      });
+
+      expect(doctorModel.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: 'new-user',
+          mdcnRegistrationNumber: '555555',
+          verificationStatus: 'INCOMPLETE',
+          isProfileComplete: false,
+        }),
+      );
+      expect(usersService.linkDoctorProfile).toHaveBeenCalledWith(
+        'new-user',
+        'new-doctor',
+      );
+      expect(result.doctorId).toBe('new-doctor');
+    });
+
     it('should allow login if doctor status is VERIFIED', async () => {
       mockDoctor.verificationStatus = 'VERIFIED';
       mockDoctor.isVerified = true;

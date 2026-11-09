@@ -5,6 +5,7 @@ import {
   IsOptional,
   IsString,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { Role } from 'src/common/enum/role.enum';
 
@@ -21,7 +22,8 @@ export class RegisterDto {
   @IsEnum(Role)
   role: Role;
 
-  @IsOptional()
+  @ValidateIf((dto) => dto.role === Role.DOCTOR)
+  @IsNotEmpty({ message: 'National doctor ID is required' })
   @IsString()
   doctorId?: string;
 

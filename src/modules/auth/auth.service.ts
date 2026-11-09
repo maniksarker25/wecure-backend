@@ -2,6 +2,8 @@ import {
   Injectable,
   UnauthorizedException,
   ForbiddenException,
+  BadRequestException,
+  ConflictException,
   Logger,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -105,6 +107,7 @@ export class AuthService {
       try {
         doctor = await this.doctorModel.create({
           userId: user._id,
+          ...this.nationalIdFromUser(user),
           isProfileComplete: false,
           verificationStatus: 'INCOMPLETE',
           isVerified: false,
@@ -156,6 +159,76 @@ export class AuthService {
       await this.usersService.linkDoctorProfile(userId, doctor._id.toString());
     }
 
+    return doctor;
+  }
+
+  private nationalIdFromUser(user: { doctorId?: string }) {
+    const value = user.doctorId?.trim();
+    if (!value || /^[a-fA-F0-9]{24}$/.test(value)) return {};
+    return { mdcnRegistrationNumber: value };
+  }
+
+  private async createDoctorAtSignup(user: any, nationalDoctorId: string) {
+    const nationalId = nationalDoctorId.trim();
+    if (!nationalId) {
+      throw new BadRequestException('National doctor ID is required');
+    }
+
+    const taken = await this.doctorModel
+      .findOne({
+        mdcnRegistrationNumber: nationalId,
+        userId: { $ne: user._id },
+      })
+      .select('_id');
+    if (taken) {
+      throw new ConflictException(
+        'This national doctor ID is already registered',
+      );
+    }
+
+    let doctor =
+      (await this.doctorModel.findOne({ userId: user._id.toString() })) ||
+      (await this.doctorModel.findOne({ userId: user._id }));
+
+    if (!doctor) {
+      try {
+        doctor = await this.doctorModel.create({
+          userId: user._id,
+          mdcnRegistrationNumber: nationalId,
+          isProfileComplete: false,
+          verificationStatus: 'INCOMPLETE',
+          isVerified: false,
+        });
+      } catch (error) {
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          (error as { code?: number }).code === 11000
+        ) {
+          doctor = await this.doctorModel.findOne({ userId: user._id });
+        } else {
+          throw error;
+        }
+      }
+    } else if (
+      doctor.verificationStatus !== 'VERIFIED' &&
+      doctor.verificationStatus !== 'SUSPENDED'
+    ) {
+      doctor.mdcnRegistrationNumber = nationalId;
+      if (typeof doctor.save === 'function') {
+        await doctor.save();
+      }
+    }
+
+    if (!doctor) {
+      throw new BadRequestException('Doctor profile could not be created');
+    }
+
+    await this.usersService.linkDoctorProfile(
+      user._id.toString(),
+      doctor._id.toString(),
+    );
     return doctor;
   }
 
@@ -299,8 +372,12 @@ export class AuthService {
       bcrypt.hash(data.password, 11),
     ]);
 
-    // Create or update pending registration
-    await this.usersService.userModel.findOneAndUpdate(
+    if (data.role === Role.DOCTOR && !data.doctorId?.trim()) {
+      throw new BadRequestException('National doctor ID is required');
+    }
+
+    // Create or update pending registration. The full name is stored here.
+    const user = await this.usersService.userModel.findOneAndUpdate(
       { email: data.email },
       {
         email: data.email,
@@ -312,8 +389,14 @@ export class AuthService {
         emailVerificationOtpExpires: expiresAt,
         isEmailVerified: false,
       },
-      { upsert: true },
+      { upsert: true, new: true },
     );
+
+    let doctorId: string | undefined;
+    if (data.role === Role.DOCTOR && user) {
+      const doctor = await this.createDoctorAtSignup(user, data.doctorId!);
+      doctorId = doctor._id.toString();
+    }
 
     // Emit event to send OTP via email
     this.eventEmitter.emit('auth.registration_otp_sent', {
@@ -324,6 +407,7 @@ export class AuthService {
     return {
       message: 'OTP sent to your email',
       otp: process.env.NODE_ENV === 'development' ? otp : undefined,
+      doctorId,
     };
   }
 

@@ -24,7 +24,10 @@ export class AuthController {
         success: true,
         statusCode: 200,
         message: result.message,
-        data: result.otp ? { otp: result.otp } : null,
+        data: {
+          ...(result.otp ? { otp: result.otp } : {}),
+          ...(result.doctorId ? { doctorId: result.doctorId } : {}),
+        },
       };
     } catch (error) {
       return {
