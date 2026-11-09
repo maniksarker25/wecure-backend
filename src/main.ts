@@ -2,6 +2,7 @@ import { Logger, ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import * as compression from 'compression';
 import * as express from 'express';
+import { Request } from 'express';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
@@ -13,12 +14,34 @@ async function bootstrap() {
   const logger = new Logger('Bootstrap');
   // const app = await NestFactory.create(AppModule);
   const app = await NestFactory.create(AppModule, {
-    rawBody: true,
+    bodyParser: false,
   });
 
-  // Body size limits for JSON and URL-encoded payloads
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  // Nest skips its raw-body parser when a jsonParser is already registered.
+  // Paystack signs the exact bytes, so this parser keeps them on req.rawBody.
+  const captureRawBody = (
+    req: Request,
+    _res: express.Response,
+    buf: Buffer,
+  ) => {
+    if (Buffer.isBuffer(buf) && buf.length > 0) {
+      (req as Request & { rawBody?: Buffer }).rawBody = buf;
+    }
+  };
+
+  app.use(
+    express.json({
+      limit: '50mb',
+      verify: captureRawBody,
+    }),
+  );
+  app.use(
+    express.urlencoded({
+      limit: '50mb',
+      extended: true,
+      verify: captureRawBody,
+    }),
+  );
 
   // Security Headers with Helmet
   app.use(

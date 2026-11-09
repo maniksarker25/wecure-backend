@@ -1,19 +1,25 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { Model } from 'mongoose';
+import { Model, Types } from 'mongoose';
 import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
 import { combineDateAndTime } from 'src/common/utils/business-time.util';
 import { NotificationsService } from 'src/modules/notifications/notifications.service';
+import { Payment, PaymentDocument } from '../payments/schemas/payment.schema';
 import { Appointment, AppointmentDocument } from './schemas/appointment.schema';
 
 @Injectable()
 export class AppointmentSchedulerService {
   private readonly logger = new Logger(AppointmentSchedulerService.name);
 
+  private readonly unpaidHoldMs = 4 * 60 * 1000;
+  private readonly checkoutHoldMs = 24 * 60 * 60 * 1000;
+
   constructor(
     @InjectModel(Appointment.name)
     private appointmentModel: Model<AppointmentDocument>,
+    @InjectModel(Payment.name)
+    private paymentModel: Model<PaymentDocument>,
     private readonly notificationsService: NotificationsService,
   ) {}
 
@@ -22,14 +28,7 @@ export class AppointmentSchedulerService {
     this.logger.verbose('Running appointment status transition job...');
 
     const now = new Date();
-    const FOUR_MINUTES_MS = 4 * 60 * 1000;
-
-    await this.appointmentModel.deleteMany({
-      status: AppointmentStatus.PENDING,
-      createdAt: {
-        $lt: new Date(Date.now() - FOUR_MINUTES_MS),
-      },
-    });
+    await this.releaseAbandonedPendingAppointments(now);
 
     // Transition candidates: exact start/end instants are resolved per-document below
     // using the absolute UTC fields if set, otherwise falling back to doctor's timezone.
@@ -92,6 +91,58 @@ export class AppointmentSchedulerService {
       );
       this.logger.log(
         `Transitioned ${ongoingResult.modifiedCount} appointments to COMPLETED`,
+      );
+    }
+  }
+
+  private async releaseAbandonedPendingAppointments(now: Date) {
+    const unpaidCutoff = new Date(now.getTime() - this.unpaidHoldMs);
+    const checkoutCutoff = new Date(now.getTime() - this.checkoutHoldMs);
+    const stale = await this.appointmentModel
+      .find({
+        status: AppointmentStatus.PENDING,
+        createdAt: { $lt: unpaidCutoff },
+      })
+      .select('_id createdAt')
+      .lean<Array<{ _id: Types.ObjectId; createdAt?: Date }>>();
+
+    if (stale.length === 0) {
+      return;
+    }
+
+    const payments = await this.paymentModel
+      .find({
+        appointmentId: { $in: stale.map((appointment) => appointment._id) },
+      })
+      .select('appointmentId')
+      .lean<Array<{ appointmentId: Types.ObjectId }>>();
+    const withPayment = new Set(
+      payments.map((payment) => payment.appointmentId.toString()),
+    );
+    const deletableIds = stale
+      .filter((appointment) => {
+        if (!withPayment.has(appointment._id.toString())) {
+          return true;
+        }
+        const createdAt = appointment.createdAt
+          ? new Date(appointment.createdAt)
+          : now;
+        return createdAt < checkoutCutoff;
+      })
+      .map((appointment) => appointment._id);
+
+    if (deletableIds.length === 0) {
+      return;
+    }
+
+    const result = await this.appointmentModel.deleteMany({
+      _id: { $in: deletableIds },
+      status: AppointmentStatus.PENDING,
+    });
+
+    if (result.deletedCount > 0) {
+      this.logger.log(
+        `Removed ${result.deletedCount} abandoned pending appointments`,
       );
     }
   }

@@ -12,6 +12,7 @@ import {
 import { DoctorsModule } from '../doctors/doctors.module';
 import { Doctor, DoctorSchema } from '../doctors/schemas/doctor.schema';
 import { PaymentsModule } from '../payments/payments.module';
+import { Payment, PaymentSchema } from '../payments/schemas/payment.schema';
 import { RefundsModule } from '../refunds/refunds.module';
 import { Review, ReviewSchema } from '../reviews/schemas/review.schema';
 import { UploadsModule } from '../uploads/uploads.module';
@@ -34,6 +35,7 @@ import {
       { name: Doctor.name, schema: DoctorSchema },
       { name: Review.name, schema: ReviewSchema },
       { name: DoctorAvailability.name, schema: DoctorAvailabilitySchema },
+      { name: Payment.name, schema: PaymentSchema },
     ]),
     AvailabilityModule,
     forwardRef(() => DoctorsModule),

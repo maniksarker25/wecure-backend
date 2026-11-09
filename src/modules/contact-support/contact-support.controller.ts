@@ -59,7 +59,7 @@ export class ContactSupportController {
         message: 'Support message submitted successfully',
         data: result,
       };
-    } catch (error) {
+    } catch (error:any) {
       return {
         success: false,
         statusCode: error.status || 400,

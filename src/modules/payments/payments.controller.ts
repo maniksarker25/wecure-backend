@@ -293,10 +293,9 @@ export class PaymentsController {
     this.logger.log('Incoming Paystack Webhook');
     this.logger.debug(`Signature: ${signature}`);
 
+    // Paystack signs webhook bodies with the secret key, not a separate whsec value.
     const webhookSecret =
-      this.configService.get<string>('PAYSTACK_WEBHOOK_SECRET') ||
-      this.configService.get<string>('PAYSTACK_SECRET_KEY') ||
-      '';
+      this.configService.get<string>('PAYSTACK_SECRET_KEY') || '';
 
     if (!webhookSecret) {
       this.logger.error('Paystack webhook secret not configured');

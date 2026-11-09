@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppointmentSchedulerService } from './appointment.scheduler';
 import { getModelToken } from '@nestjs/mongoose';
+import { Payment } from '../payments/schemas/payment.schema';
 import { Appointment } from './schemas/appointment.schema';
 import { AppointmentStatus } from '../../common/enum/appointment-status.enum';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -21,6 +22,13 @@ describe('Appointment Verification', () => {
   const mockNotificationsService = {
     emit: jest.fn(),
   };
+  const mockPaymentModel = {
+    find: jest.fn().mockReturnValue({
+      select: jest.fn().mockReturnValue({
+        lean: jest.fn().mockResolvedValue([]),
+      }),
+    }),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -36,6 +44,10 @@ describe('Appointment Verification', () => {
         {
           provide: getModelToken(Appointment.name),
           useValue: mockAppointmentModel,
+        },
+        {
+          provide: getModelToken(Payment.name),
+          useValue: mockPaymentModel,
         },
         {
           provide: NotificationsService,
