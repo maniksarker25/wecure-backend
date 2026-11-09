@@ -366,16 +366,28 @@ export class PaymentsController {
         if (metadata?.type === 'APPOINTMENT') {
           const payment = await this.paymentsService.findByReference(reference);
 
-          if (payment && payment.status !== 'PAID') {
+          if (!payment) {
+            this.logger.error(
+              `Paid Paystack reference ${reference} has no local payment record`,
+            );
+            break;
+          }
+
+          const wasUnpaid = payment.status !== 'PAID';
+          if (wasUnpaid) {
             await this.paymentsService.updateStatus(reference, 'PAID');
+          }
 
-            if (metadata.appointmentId) {
-              await this.appointmentManagerService.markAsPaid(
-                metadata.appointmentId,
-                payment._id.toString(),
-              );
-            }
+          if (metadata.appointmentId && !payment.isRefunded) {
+            await this.appointmentManagerService.settleSuccessfulPayment(
+              metadata.appointmentId,
+              payment._id.toString(),
+              metadata.userId,
+              metadata.doctorId,
+            );
+          }
 
+          if (wasUnpaid) {
             await this.auditLogsService.create({
               userId: metadata.userId,
               action: 'PAYMENT_SUCCESS',

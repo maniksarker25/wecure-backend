@@ -1,6 +1,9 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
 import { Document, Types } from 'mongoose';
-import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
+import {
+  APPOINTMENT_SLOT_HELD_STATUSES,
+  AppointmentStatus,
+} from 'src/common/enum/appointment-status.enum';
 
 export type AppointmentDocument = Appointment & Document;
 
@@ -77,13 +80,22 @@ export class Appointment {
 
   @Prop()
   doctorTimezone?: string;
+
+  @Prop()
+  expiredAt?: Date;
 }
 
 export const AppointmentSchema = SchemaFactory.createForClass(Appointment);
 
 AppointmentSchema.index(
   { doctorId: 1, appointmentDate: 1, appointmentTime: 1 },
-  { unique: true, partialFilterExpression: { status: { $ne: 'CANCELLED' } } },
+  {
+    unique: true,
+    name: 'idx_appt_doctor_date_time_unique',
+    partialFilterExpression: {
+      status: { $in: [...APPOINTMENT_SLOT_HELD_STATUSES] },
+    },
+  },
 );
 AppointmentSchema.index({ userId: 1, appointmentDate: -1 });
 AppointmentSchema.index({ doctorId: 1, appointmentDate: -1 });

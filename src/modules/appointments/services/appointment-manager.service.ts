@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
@@ -33,6 +34,8 @@ import { AppointmentValidatorService } from './appointment-validator.service';
 
 @Injectable()
 export class AppointmentManagerService {
+  private readonly logger = new Logger(AppointmentManagerService.name);
+
   constructor(
     @InjectModel(Appointment.name)
     private appointmentModel: Model<AppointmentDocument>,
@@ -116,8 +119,16 @@ export class AppointmentManagerService {
 
     const doctorTz = (doctor?.userId as any)?.timezone || 'Africa/Lagos';
     const patientTz = (patientUser as any)?.timezone || 'Africa/Lagos';
-    const startTimeUtc = combineDateAndTime(dto.appointmentDate, dto.appointmentTime, doctorTz);
-    const endTimeUtc = combineDateAndTime(dto.appointmentDate, endTime, doctorTz);
+    const startTimeUtc = combineDateAndTime(
+      dto.appointmentDate,
+      dto.appointmentTime,
+      doctorTz,
+    );
+    const endTimeUtc = combineDateAndTime(
+      dto.appointmentDate,
+      endTime,
+      doctorTz,
+    );
 
     // 2. Validate general availability outside transaction
     const dayAvailability =
@@ -218,9 +229,11 @@ export class AppointmentManagerService {
 
     // Check if already in terminal state
     if (
-      [AppointmentStatus.COMPLETED, AppointmentStatus.CANCELLED].includes(
-        appointment.status,
-      )
+      [
+        AppointmentStatus.COMPLETED,
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.EXPIRED,
+      ].includes(appointment.status)
     ) {
       throw new BadRequestException(
         `Cannot reject appointment that is already ${appointment.status}`,
@@ -230,14 +243,11 @@ export class AppointmentManagerService {
     appointment.status = AppointmentStatus.CANCELLED;
     const updatedAppointment = await appointment.save();
 
-    // Trigger Refund (Full Refund for Doctor Rejection)
-    if (appointment.paymentId) {
-      await this.refundsService.processFullRefund(
-        appointment._id.toString(),
-        appointment,
-        userId,
-      );
-    }
+    const { refundStarted, refundFailed } = await this.refundCancellation(
+      appointment,
+      userId,
+      'full',
+    );
 
     this.notificationsService.emit('appointment.rejected', {
       appointmentId: appointment._id,
@@ -246,6 +256,9 @@ export class AppointmentManagerService {
       appointmentDate: appointment.appointmentDate,
       appointmentTime: appointment.appointmentTime,
       reason: dto?.reason,
+      hadPayment: !!appointment.paymentId,
+      refundStarted,
+      refundFailed,
     });
 
     return updatedAppointment;
@@ -289,9 +302,11 @@ export class AppointmentManagerService {
 
     // Prevent updating if already in a terminal state
     if (
-      [AppointmentStatus.COMPLETED, AppointmentStatus.CANCELLED].includes(
-        appointment.status,
-      )
+      [
+        AppointmentStatus.COMPLETED,
+        AppointmentStatus.CANCELLED,
+        AppointmentStatus.EXPIRED,
+      ].includes(appointment.status)
     ) {
       throw new BadRequestException(
         `Appointment is already ${appointment.status} and cannot be updated.`,
@@ -302,17 +317,18 @@ export class AppointmentManagerService {
     appointment.status = status;
     const updatedAppointment = await appointment.save();
 
-    // Trigger Refund if Cancellation by Patient
-    if (
-      status === AppointmentStatus.CANCELLED &&
-      role === 'USER' &&
-      appointment.paymentId
-    ) {
-      await this.refundsService.processPartialRefund(
-        appointment._id.toString(),
+    let refundStarted = false;
+    let refundFailed = false;
+    let refundAmount: number | undefined;
+    if (status === AppointmentStatus.CANCELLED) {
+      const refund = await this.refundCancellation(
         appointment,
         requesterId,
+        role === 'USER' ? 'partial' : 'full',
       );
+      refundStarted = refund.refundStarted;
+      refundFailed = refund.refundFailed;
+      refundAmount = refund.refundAmount;
     }
 
     if (
@@ -333,6 +349,13 @@ export class AppointmentManagerService {
         oldStatus,
         userId: appointment.userId,
         doctorId: appointment.doctorId,
+        appointmentDate: appointment.appointmentDate,
+        appointmentTime: appointment.appointmentTime,
+        cancelledBy: role === 'USER' ? 'PATIENT' : 'DOCTOR',
+        hadPayment: !!appointment.paymentId,
+        refundStarted,
+        refundFailed,
+        refundAmount,
       });
     }
 
@@ -340,18 +363,97 @@ export class AppointmentManagerService {
   }
 
   async cancelUpcomingForDoctor(doctorId: string) {
-    const { dateOnly: today } = getBusinessNow();
-
-    return this.appointmentModel.updateMany(
-      {
+    try {
+      const doctor = await this.doctorModel
+        .findById(doctorId)
+        .select('userId')
+        .lean();
+      const initiatedBy = doctor?.userId?.toString() || doctorId;
+      const { dateOnly: today } = getBusinessNow();
+      const appointments = await this.appointmentModel.find({
         doctorId: new Types.ObjectId(doctorId),
         appointmentDate: { $gte: today },
         status: {
-          $nin: [AppointmentStatus.COMPLETED, AppointmentStatus.CANCELLED],
+          $nin: [
+            AppointmentStatus.COMPLETED,
+            AppointmentStatus.CANCELLED,
+            AppointmentStatus.EXPIRED,
+          ],
         },
-      },
-      { status: AppointmentStatus.CANCELLED },
-    );
+      });
+
+      for (const appointment of appointments) {
+        const oldStatus = appointment.status;
+        appointment.status = AppointmentStatus.CANCELLED;
+        await appointment.save();
+        const { refundStarted } = await this.refundCancellation(
+          appointment,
+          initiatedBy,
+          'full',
+        );
+        this.notificationsService.emit('appointment.status_change', {
+          appointmentId: appointment._id,
+          status: AppointmentStatus.CANCELLED,
+          oldStatus,
+          userId: appointment.userId,
+          doctorId: appointment.doctorId,
+          appointmentDate: appointment.appointmentDate,
+          appointmentTime: appointment.appointmentTime,
+          cancelledBy: 'DOCTOR_UNAVAILABLE',
+          hadPayment: !!appointment.paymentId,
+          refundStarted,
+          notifyDoctor: false,
+        });
+      }
+
+      if (appointments.length > 0 && doctor?.userId) {
+        this.notificationsService.emit('appointment.schedule_cleared', {
+          doctorUserId: doctor.userId,
+          count: appointments.length,
+        });
+      }
+    } catch (error) {
+      this.logger.error(
+        `Failed to cancel upcoming appointments for doctor ${doctorId}`,
+        error,
+      );
+    }
+  }
+
+  private async refundCancellation(
+    appointment: AppointmentDocument,
+    initiatedBy: string,
+    kind: 'full' | 'partial',
+  ) {
+    if (!appointment.paymentId) {
+      return { refundStarted: false, refundFailed: false };
+    }
+
+    try {
+      const refund =
+        kind === 'partial'
+          ? await this.refundsService.processPartialRefund(
+              appointment._id.toString(),
+              appointment,
+              initiatedBy,
+            )
+          : await this.refundsService.processFullRefund(
+              appointment._id.toString(),
+              appointment,
+              initiatedBy,
+            );
+      return {
+        refundStarted: !!refund,
+        refundFailed: false,
+        refundAmount: refund?.amount,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Refund failed for cancelled appointment ${appointment._id}`,
+        error,
+      );
+      return { refundStarted: false, refundFailed: true };
+    }
   }
 
   // ---------------- Attachments ----------------
@@ -415,6 +517,150 @@ export class AppointmentManagerService {
     }
 
     return appointment;
+  }
+
+  /**
+   * Apply a verified Paystack charge to an existing appointment.
+   * A pending booking becomes upcoming. An expired booking is restored when
+   * its slot is still free and the visit has not started; otherwise the
+   * charge is refunded and the appointment stays expired.
+   */
+  async settleSuccessfulPayment(
+    appointmentId: string,
+    paymentId: string,
+    payerUserId?: string,
+    doctorId?: string,
+  ) {
+    const appointment = await this.appointmentModel.findById(appointmentId);
+    if (!appointment) {
+      await this.refundsService.refundOrphanedAppointmentPayment({
+        paymentId,
+        appointmentId,
+        userId: payerUserId,
+        doctorId,
+      });
+      return { outcome: 'refunded' as const };
+    }
+
+    if (!appointment.paymentId) {
+      appointment.paymentId = new Types.ObjectId(paymentId);
+      await appointment.save();
+    }
+
+    if (
+      [
+        AppointmentStatus.UPCOMING,
+        AppointmentStatus.ONGOING,
+        AppointmentStatus.COMPLETED,
+      ].includes(appointment.status)
+    ) {
+      return { outcome: 'already_active' as const, appointment };
+    }
+
+    if (appointment.status === AppointmentStatus.PENDING) {
+      const updated = await this.markAsPaid(appointmentId, paymentId);
+      return { outcome: 'confirmed' as const, appointment: updated };
+    }
+
+    if (appointment.status !== AppointmentStatus.EXPIRED) {
+      await this.refundExpiredBooking(appointment, payerUserId);
+      return { outcome: 'refunded' as const, appointment };
+    }
+
+    const timezone = appointment.doctorTimezone || 'Africa/Lagos';
+    const start = appointment.startTimeUtc
+      ? new Date(appointment.startTimeUtc)
+      : combineDateAndTime(
+          appointment.appointmentDate,
+          appointment.appointmentTime,
+          timezone,
+        );
+
+    if (start.getTime() <= Date.now()) {
+      await this.refundExpiredBooking(appointment, payerUserId);
+      return { outcome: 'refunded' as const, appointment };
+    }
+
+    const session = await this.connection.startSession();
+    let transactionOpen = false;
+    try {
+      session.startTransaction();
+      transactionOpen = true;
+
+      const conflict = await this.validatorService.findSlotConflict(
+        appointment.doctorId.toString(),
+        appointment.appointmentDate,
+        appointment.appointmentTime,
+        appointment.appointmentEndTime,
+        session,
+        appointment._id.toString(),
+      );
+
+      if (conflict) {
+        await session.abortTransaction();
+        transactionOpen = false;
+        await this.refundExpiredBooking(appointment, payerUserId);
+        return { outcome: 'refunded' as const, appointment };
+      }
+
+      const restored = await this.appointmentModel.findOneAndUpdate(
+        { _id: appointment._id, status: AppointmentStatus.EXPIRED },
+        {
+          $set: {
+            status: AppointmentStatus.UPCOMING,
+            paymentId: new Types.ObjectId(paymentId),
+          },
+        },
+        { new: true, session },
+      );
+
+      if (!restored) {
+        await session.abortTransaction();
+        transactionOpen = false;
+        await this.refundExpiredBooking(appointment, payerUserId);
+        return { outcome: 'refunded' as const, appointment };
+      }
+
+      await session.commitTransaction();
+      transactionOpen = false;
+      this.notificationsService.emit('appointment.payment_confirmed', restored);
+      return { outcome: 'restored' as const, appointment: restored };
+    } catch (error) {
+      if (transactionOpen) {
+        await session.abortTransaction();
+      }
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        (error as { code?: number }).code === 11000
+      ) {
+        await this.refundExpiredBooking(appointment, payerUserId);
+        return { outcome: 'refunded' as const, appointment };
+      }
+      throw error;
+    } finally {
+      await session.endSession();
+    }
+  }
+
+  private async refundExpiredBooking(
+    appointment: AppointmentDocument,
+    payerUserId?: string,
+  ) {
+    const initiatedBy = payerUserId || appointment.userId.toString();
+    try {
+      await this.refundsService.processExpiredBookingRefund(
+        appointment._id.toString(),
+        appointment,
+        initiatedBy,
+      );
+    } catch (error) {
+      this.logger.error(
+        `Refund failed for expired appointment ${appointment._id}`,
+        error,
+      );
+    }
   }
 
   // ---------------- Helpers ----------------

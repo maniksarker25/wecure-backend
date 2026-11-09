@@ -7,6 +7,7 @@ export enum RefundReason {
   DOCTOR_CANCELLED = 'DOCTOR_CANCELLED',
   PATIENT_CANCELLED = 'PATIENT_CANCELLED',
   ADMIN_REFUND = 'ADMIN_REFUND',
+  BOOKING_EXPIRED = 'BOOKING_EXPIRED',
 }
 
 export enum RefundStatus {
@@ -27,8 +28,8 @@ export class Refund {
   @Prop({ type: Types.ObjectId, ref: 'User', required: true })
   userId: Types.ObjectId; // Patient receiving refund
 
-  @Prop({ type: Types.ObjectId, ref: 'Doctor', required: true })
-  doctorId: Types.ObjectId;
+  @Prop({ type: Types.ObjectId, ref: 'Doctor' })
+  doctorId?: Types.ObjectId;
 
   @Prop({ required: true })
   amount: number; // Refund amount
@@ -56,6 +57,9 @@ export class Refund {
 
   @Prop()
   failureReason: string;
+
+  @Prop({ default: 0 })
+  retryCount: number;
 
   @Prop({ type: Object })
   metadata: Record<string, any>;

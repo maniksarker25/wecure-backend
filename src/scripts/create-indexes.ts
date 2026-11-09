@@ -30,12 +30,25 @@ async function createIndexes() {
   // ── appointments ──────────────────────────────────────────────────────────
   console.log('Creating indexes on: appointments');
   const appointments = db.collection('appointments');
+  for (const indexName of [
+    'idx_appt_doctor_date_time_unique',
+    'doctorId_1_appointmentDate_1_appointmentTime_1',
+  ]) {
+    try {
+      await appointments.dropIndex(indexName);
+      console.log(`  dropped ${indexName}`);
+    } catch {
+      // The previous unique index may not exist on a fresh database.
+    }
+  }
   await appointments.createIndexes([
-    // Unique slot guard (non-cancelled appointments)
+    // Unique slot guard. EXPIRED and CANCELLED do not hold the time.
     {
       key: { doctorId: 1, appointmentDate: 1, appointmentTime: 1 },
       unique: true,
-      partialFilterExpression: { status: { $ne: 'CANCELLED' } },
+      partialFilterExpression: {
+        status: { $in: ['PENDING', 'UPCOMING', 'ONGOING', 'COMPLETED'] },
+      },
       name: 'idx_appt_doctor_date_time_unique',
     },
     // ── Compound listing queries (getForUser / getForDoctorSimple) ──

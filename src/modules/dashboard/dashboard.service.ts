@@ -34,7 +34,9 @@ export class DashboardService {
     ]);
 
     // 2. Appointment Stats Filtered by Year/Month
-    const appointmentMatch: any = {};
+    const appointmentMatch: any = {
+      status: { $ne: AppointmentStatus.EXPIRED },
+    };
     if (targetMonth) {
       const startOfMonth = new Date(targetYear, targetMonth - 1, 1);
       const endOfMonth = new Date(targetYear, targetMonth, 1);

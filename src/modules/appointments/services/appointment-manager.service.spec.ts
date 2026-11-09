@@ -12,11 +12,14 @@ import { EncryptionService } from 'src/common/services/encryption.service';
 import { AgoraService } from '../../agora/agora.service';
 import { RefundsService } from '../../refunds/refunds.service';
 import { BadRequestException } from '@nestjs/common';
+import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
 
 describe('AppointmentManagerService', () => {
   let service: AppointmentManagerService;
   let appointmentModel: any;
-  let validatorService: AppointmentValidatorService;
+  let validatorService: any;
+  let notificationsService: { emit: jest.Mock };
+  let refundsService: { processExpiredBookingRefund: jest.Mock };
 
   const mockUserId = new Types.ObjectId().toString();
   const mockDoctorId = new Types.ObjectId().toString();
@@ -32,6 +35,7 @@ describe('AppointmentManagerService', () => {
             findById: jest.fn(),
             updateMany: jest.fn(),
             findByIdAndUpdate: jest.fn(),
+            findOneAndUpdate: jest.fn(),
           },
         },
         {
@@ -53,6 +57,7 @@ describe('AppointmentManagerService', () => {
           useValue: {
             validateGeneralAvailability: jest.fn(),
             checkOverlap: jest.fn(),
+            findSlotConflict: jest.fn(),
           },
         },
         {
@@ -83,6 +88,7 @@ describe('AppointmentManagerService', () => {
           provide: RefundsService,
           useValue: {
             processFullRefund: jest.fn(),
+            processExpiredBookingRefund: jest.fn(),
           },
         },
         {
@@ -97,7 +103,9 @@ describe('AppointmentManagerService', () => {
             model: jest.fn().mockReturnValue({
               findById: jest.fn().mockReturnValue({
                 select: jest.fn().mockReturnValue({
-                  lean: jest.fn().mockResolvedValue({ timezone: 'Africa/Lagos' }),
+                  lean: jest
+                    .fn()
+                    .mockResolvedValue({ timezone: 'Africa/Lagos' }),
                 }),
               }),
             }),
@@ -108,9 +116,9 @@ describe('AppointmentManagerService', () => {
 
     service = module.get<AppointmentManagerService>(AppointmentManagerService);
     appointmentModel = module.get(getModelToken(Appointment.name));
-    validatorService = module.get<AppointmentValidatorService>(
-      AppointmentValidatorService,
-    );
+    validatorService = module.get(AppointmentValidatorService);
+    notificationsService = module.get(NotificationsService);
+    refundsService = module.get(RefundsService);
   });
 
   describe('create', () => {
@@ -218,6 +226,78 @@ describe('AppointmentManagerService', () => {
 
       expect(mockAppt.status).toBe('UPCOMING');
       expect(mockAppt.save).toHaveBeenCalled();
+    });
+  });
+
+  describe('settleSuccessfulPayment', () => {
+    const paymentId = new Types.ObjectId().toString();
+
+    function expiredAppointment(startTimeUtc: Date) {
+      return {
+        _id: new Types.ObjectId(),
+        userId: new Types.ObjectId(),
+        doctorId: new Types.ObjectId(),
+        status: AppointmentStatus.EXPIRED,
+        appointmentDate: new Date('2026-11-10T00:00:00.000Z'),
+        appointmentTime: '10:00',
+        appointmentEndTime: '10:30',
+        startTimeUtc,
+        doctorTimezone: 'Africa/Lagos',
+        paymentId: undefined,
+        save: jest.fn().mockImplementation(function (this: any) {
+          return Promise.resolve(this);
+        }),
+      };
+    }
+
+    it('restores an expired appointment when the slot is still free', async () => {
+      const appointment = expiredAppointment(
+        new Date('2026-12-01T10:00:00.000Z'),
+      );
+      appointmentModel.findById.mockResolvedValue(appointment);
+      validatorService.findSlotConflict.mockResolvedValue(null);
+      appointmentModel.findOneAndUpdate.mockResolvedValue({
+        ...appointment,
+        status: AppointmentStatus.UPCOMING,
+      });
+
+      const result = await service.settleSuccessfulPayment(
+        appointment._id.toString(),
+        paymentId,
+        appointment.userId.toString(),
+      );
+
+      expect(result.outcome).toBe('restored');
+      expect(notificationsService.emit).toHaveBeenCalledWith(
+        'appointment.payment_confirmed',
+        expect.objectContaining({ status: AppointmentStatus.UPCOMING }),
+      );
+      expect(refundsService.processExpiredBookingRefund).not.toHaveBeenCalled();
+    });
+
+    it('refunds an expired appointment when another booking holds the slot', async () => {
+      const appointment = expiredAppointment(
+        new Date('2026-12-01T10:00:00.000Z'),
+      );
+      appointmentModel.findById.mockResolvedValue(appointment);
+      validatorService.findSlotConflict.mockResolvedValue({
+        appointmentTime: '10:00',
+        appointmentEndTime: '10:30',
+      } as any);
+
+      const result = await service.settleSuccessfulPayment(
+        appointment._id.toString(),
+        paymentId,
+        appointment.userId.toString(),
+      );
+
+      expect(result.outcome).toBe('refunded');
+      expect(notificationsService.emit).not.toHaveBeenCalled();
+      expect(refundsService.processExpiredBookingRefund).toHaveBeenCalledWith(
+        appointment._id.toString(),
+        appointment,
+        appointment.userId.toString(),
+      );
     });
   });
 });

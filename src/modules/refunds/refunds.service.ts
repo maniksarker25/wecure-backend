@@ -19,7 +19,12 @@ import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { ConfigService } from '@nestjs/config';
 import { CreateRefundDto } from './dto/create-refund.dto';
 import { RefundFiltersDto } from './dto/refund-filters.dto';
-import { Appointment } from '../appointments/schemas/appointment.schema';
+import {
+  Appointment,
+  AppointmentDocument,
+} from '../appointments/schemas/appointment.schema';
+import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
+import { NotificationsService } from '../notifications/notifications.service';
 import { combineDateAndTime } from 'src/common/utils/business-time.util';
 
 @Injectable()
@@ -32,6 +37,9 @@ export class RefundsService {
     private readonly paystackService: PaystackService,
     private readonly auditLogsService: AuditLogsService,
     private readonly configService: ConfigService,
+    private readonly notificationsService: NotificationsService,
+    @InjectModel(Appointment.name)
+    private readonly appointmentModel: Model<AppointmentDocument>,
   ) {}
 
   /**
@@ -73,6 +81,52 @@ export class RefundsService {
     dto.amount = payment.amount; // 100% refund
     dto.refundPercentage = 100;
     dto.reason = RefundReason.DOCTOR_CANCELLED;
+    dto.initiatedBy = initiatedBy;
+
+    return this.initiateRefund(dto, payment.paystackReference);
+  }
+
+  /**
+   * Full refund when a late payment arrives for an expired booking whose slot
+   * can no longer be restored.
+   */
+  async processExpiredBookingRefund(
+    appointmentId: string,
+    appointment: Appointment,
+    initiatedBy: string,
+  ): Promise<Refund | null> {
+    let payment: PaymentDocument | null = null;
+    if (appointment.paymentId) {
+      payment = await this.paymentModel.findById(appointment.paymentId).exec();
+    }
+
+    if (!payment) {
+      payment = await this.paymentModel
+        .findOne({ appointmentId: new Types.ObjectId(appointmentId) })
+        .exec();
+    }
+
+    if (!payment) {
+      this.logger.warn(`No payment found for appointment ${appointmentId}`);
+      return null;
+    }
+
+    if (payment.isRefunded) {
+      this.logger.warn(
+        `Payment ${payment._id} for expired appointment ${appointmentId} is already refunded`,
+      );
+      return null;
+    }
+
+    const dto = new CreateRefundDto();
+    dto.paymentId = payment._id.toString();
+    dto.appointmentId = appointmentId;
+    dto.userId = appointment.userId.toString();
+    dto.doctorId = appointment.doctorId.toString();
+    dto.originalAmount = payment.amount;
+    dto.amount = payment.amount;
+    dto.refundPercentage = 100;
+    dto.reason = RefundReason.BOOKING_EXPIRED;
     dto.initiatedBy = initiatedBy;
 
     return this.initiateRefund(dto, payment.paystackReference);
@@ -177,9 +231,10 @@ export class RefundsService {
       paymentId: new Types.ObjectId(dto.paymentId),
       appointmentId: new Types.ObjectId(dto.appointmentId),
       userId: new Types.ObjectId(dto.userId),
-      doctorId: new Types.ObjectId(dto.doctorId),
+      ...(dto.doctorId ? { doctorId: new Types.ObjectId(dto.doctorId) } : {}),
       initiatedBy: new Types.ObjectId(dto.initiatedBy),
       status: RefundStatus.PENDING,
+      retryCount: 1,
     });
     await refund.save();
 
@@ -209,9 +264,7 @@ export class RefundsService {
         refundId: refund._id,
         refundedAmount: dto.amount,
         refundedAt: new Date(),
-        status: 'REFUNDED', // Or keep as PAID but mark refunded? Schema has status enum ['PENDING', 'PAID', 'FAILED']. Let's stick to existing or update schema if needed.
-        // Existing schema had limited statuses. I might want to add 'REFUNDED' or 'PARTIALLY_REFUNDED'.
-        // For now, let's keep status 'PAID' (as the original transaction was paid) but use the flags isRefunded.
+        status: 'PAID',
       });
 
       // 5. Create Audit Log
@@ -221,12 +274,15 @@ export class RefundsService {
         resource: 'Refund',
         resourceId: refund._id.toString(),
         metadata: {
-          // Assuming metadata accepts Object now or I cast it
           amount: dto.amount,
           reason: dto.reason,
           appointmentId: dto.appointmentId,
         } as any,
       });
+
+      if (dto.reason === RefundReason.BOOKING_EXPIRED) {
+        await this.notifyExpiredRefundStarted(refund);
+      }
 
       return refund;
     } catch (error) {
@@ -323,12 +379,185 @@ export class RefundsService {
         resourceId: refund._id.toString(),
         metadata: { paystackRefundId: payload.id },
       });
+      this.notificationsService.emit('appointment.refund_completed', {
+        userId: refund.userId,
+        doctorId: refund.doctorId,
+        appointmentId: refund.appointmentId,
+        amount: refund.amount,
+        reason: refund.reason,
+      });
     } else if (payload.status === 'failed') {
       refund.status = RefundStatus.FAILED;
       refund.failureReason = 'Refund failed at Paystack';
+      refund.retryCount = (refund.retryCount || 0) + 1;
       await refund.save();
+      await this.paymentModel.findByIdAndUpdate(refund.paymentId, {
+        $set: { isRefunded: false, refundedAmount: 0 },
+        $unset: { refundId: '', refundedAt: '' },
+      });
 
       this.logger.error(`Refund ${refund._id} marked as FAILED via webhook`);
+      if (refund.reason !== RefundReason.BOOKING_EXPIRED) {
+        this.notificationsService.emit('appointment.refund_failed', {
+          userId: refund.userId,
+          doctorId: refund.doctorId,
+          appointmentId: refund.appointmentId,
+          amount: refund.amount,
+          reason: refund.reason,
+        });
+      }
     }
+  }
+
+  /**
+   * Refund a captured appointment payment whose booking document is gone.
+   */
+  async refundOrphanedAppointmentPayment(input: {
+    paymentId: string;
+    appointmentId: string;
+    userId?: string;
+    doctorId?: string;
+  }): Promise<Refund | null> {
+    const payment = await this.paymentModel.findById(input.paymentId).exec();
+    if (!payment) {
+      this.logger.warn(`No payment ${input.paymentId} found for orphan refund`);
+      return null;
+    }
+    if (payment.isRefunded) {
+      return null;
+    }
+
+    const userId = input.userId || payment.userId?.toString();
+    if (!userId) {
+      this.logger.warn(
+        `Payment ${payment._id} has no user for an orphan refund`,
+      );
+      return null;
+    }
+
+    const dto = new CreateRefundDto();
+    dto.paymentId = payment._id.toString();
+    dto.appointmentId = input.appointmentId;
+    dto.userId = userId;
+    if (input.doctorId) dto.doctorId = input.doctorId;
+    dto.originalAmount = payment.amount;
+    dto.amount = payment.amount;
+    dto.refundPercentage = 100;
+    dto.reason = RefundReason.BOOKING_EXPIRED;
+    dto.initiatedBy = userId;
+
+    return this.initiateRefund(dto, payment.paystackReference);
+  }
+
+  async retryFailedBookingRefunds() {
+    const failed = await this.refundModel
+      .find({
+        reason: RefundReason.BOOKING_EXPIRED,
+        status: RefundStatus.FAILED,
+      })
+      .sort({ createdAt: -1 })
+      .exec();
+
+    const groups = new Map<string, RefundDocument[]>();
+    for (const refund of failed) {
+      const key = refund.paymentId.toString();
+      const list = groups.get(key) || [];
+      list.push(refund);
+      groups.set(key, list);
+    }
+
+    for (const [paymentId, attempts] of groups) {
+      const payment = await this.paymentModel.findById(paymentId).exec();
+      if (!payment || payment.isRefunded) continue;
+
+      const open = await this.refundModel.exists({
+        paymentId: payment._id,
+        status: {
+          $in: [
+            RefundStatus.PENDING,
+            RefundStatus.PROCESSING,
+            RefundStatus.COMPLETED,
+          ],
+        },
+      });
+      if (open) continue;
+
+      const latest = attempts[0];
+      const appointment = await this.appointmentModel
+        .findById(latest.appointmentId)
+        .exec();
+      if (
+        appointment &&
+        [
+          AppointmentStatus.UPCOMING,
+          AppointmentStatus.ONGOING,
+          AppointmentStatus.COMPLETED,
+        ].includes(appointment.status as AppointmentStatus)
+      ) {
+        continue;
+      }
+
+      if (attempts.length >= 3) {
+        if (!latest.metadata?.failureNotified) {
+          this.notificationsService.emit('appointment.refund_failed', {
+            userId: latest.userId,
+            doctorId: latest.doctorId,
+            appointmentId: latest.appointmentId,
+            amount: latest.amount,
+            reason: latest.reason,
+          });
+          latest.metadata = {
+            ...(latest.metadata || {}),
+            failureNotified: true,
+          };
+          await latest.save();
+        }
+        continue;
+      }
+
+      try {
+        if (appointment) {
+          await this.processExpiredBookingRefund(
+            appointment._id.toString(),
+            appointment,
+            latest.initiatedBy.toString(),
+          );
+        } else {
+          await this.refundOrphanedAppointmentPayment({
+            paymentId,
+            appointmentId: latest.appointmentId.toString(),
+            userId: latest.userId.toString(),
+            doctorId: latest.doctorId?.toString(),
+          });
+        }
+      } catch (error) {
+        this.logger.error(
+          `Retry failed for booking refund payment ${paymentId}`,
+          error,
+        );
+      }
+    }
+  }
+
+  private async notifyExpiredRefundStarted(refund: RefundDocument) {
+    const earlier = await this.refundModel.countDocuments({
+      paymentId: refund.paymentId,
+      _id: { $ne: refund._id },
+      status: { $in: [RefundStatus.PROCESSING, RefundStatus.COMPLETED] },
+    });
+    if (earlier > 0) return;
+
+    const appointment = await this.appointmentModel
+      .findById(refund.appointmentId)
+      .select('appointmentDate appointmentTime')
+      .lean();
+
+    this.notificationsService.emit('appointment.expired_refund', {
+      appointmentId: refund.appointmentId,
+      userId: refund.userId,
+      appointmentDate: appointment?.appointmentDate,
+      appointmentTime: appointment?.appointmentTime,
+      amount: refund.amount,
+    });
   }
 }

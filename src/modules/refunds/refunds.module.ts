@@ -2,7 +2,12 @@ import { Module, forwardRef } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { RefundsService } from './refunds.service';
 import { RefundsController } from './refunds.controller';
+import { RefundRetryScheduler } from './refund-retry.scheduler';
 import { Refund, RefundSchema } from './schemas/refund.schema';
+import {
+  Appointment,
+  AppointmentSchema,
+} from '../appointments/schemas/appointment.schema';
 import { Payment, PaymentSchema } from '../payments/schemas/payment.schema';
 import { PaymentsModule } from '../payments/payments.module'; // Import to use exported PaystackService if available, or just providers
 import { HttpModule } from '@nestjs/axios';
@@ -15,6 +20,7 @@ import { AppointmentsModule } from '../appointments/appointments.module';
     MongooseModule.forFeature([
       { name: Refund.name, schema: RefundSchema },
       { name: Payment.name, schema: PaymentSchema },
+      { name: Appointment.name, schema: AppointmentSchema },
     ]),
     HttpModule,
     AuditLogsModule,
@@ -23,7 +29,7 @@ import { AppointmentsModule } from '../appointments/appointments.module';
     forwardRef(() => AppointmentsModule),
   ],
   controllers: [RefundsController],
-  providers: [RefundsService],
+  providers: [RefundsService, RefundRetryScheduler],
   exports: [RefundsService],
 })
 export class RefundsModule {}

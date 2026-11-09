@@ -105,20 +105,52 @@ export class AppointmentValidatorService {
     appointmentTime: string,
     appointmentEndTime: string,
     session: any,
+    excludeAppointmentId?: string,
   ) {
-    // 5. Fetch all non-cancelled appointments for the same day and check overlap in JS
+    const conflict = await this.findSlotConflict(
+      doctorId,
+      appointmentDate,
+      appointmentTime,
+      appointmentEndTime,
+      session,
+      excludeAppointmentId,
+    );
+
+    if (conflict) {
+      throw new BadRequestException(
+        `This time slot overlaps with an existing appointment (${conflict.appointmentTime} - ${conflict.appointmentEndTime || conflict.appointmentTime})`,
+      );
+    }
+  }
+
+  async findSlotConflict(
+    doctorId: string,
+    appointmentDate: Date,
+    appointmentTime: string,
+    appointmentEndTime: string,
+    session?: any,
+    excludeAppointmentId?: string,
+  ) {
     const { start: startOfDay, end: endOfDay } =
       getUtcDayBounds(appointmentDate);
+    const filter: Record<string, unknown> = {
+      doctorId: new Types.ObjectId(doctorId),
+      appointmentDate: { $gte: startOfDay, $lt: endOfDay },
+      status: {
+        $nin: [AppointmentStatus.CANCELLED, AppointmentStatus.EXPIRED],
+      },
+    };
+    if (excludeAppointmentId) {
+      filter._id = { $ne: new Types.ObjectId(excludeAppointmentId) };
+    }
 
-    const appointments = await this.appointmentModel
-      .find({
-        doctorId: new Types.ObjectId(doctorId),
-        appointmentDate: { $gte: startOfDay, $lt: endOfDay },
-        status: { $ne: AppointmentStatus.CANCELLED },
-      })
-      .select('appointmentTime appointmentEndTime')
-      .session(session)
-      .lean();
+    let query = this.appointmentModel
+      .find(filter)
+      .select('appointmentTime appointmentEndTime');
+    if (session) {
+      query = query.session(session);
+    }
+    const appointments = await query.lean();
 
     const toMinutes = (time: string) => {
       const [h, m] = time.split(':').map(Number);
@@ -132,13 +164,12 @@ export class AppointmentValidatorService {
       const existingStart = toMinutes(a.appointmentTime);
       const existingEnd = toMinutes(a.appointmentEndTime || a.appointmentTime);
 
-      // Overlap if S1 < E2 && E1 > S2
       if (apptStart < existingEnd && apptEnd > existingStart) {
-        throw new BadRequestException(
-          `This time slot overlaps with an existing appointment (${a.appointmentTime} - ${a.appointmentEndTime || a.appointmentTime})`,
-        );
+        return a;
       }
     }
+
+    return null;
   }
 
   async getAvailableSlots(doctorId: string, date: Date) {
@@ -201,7 +232,9 @@ export class AppointmentValidatorService {
       .find({
         doctorId: new Types.ObjectId(doctorId),
         appointmentDate: { $gte: slotsDayStart, $lt: slotsDayEnd },
-        status: { $ne: AppointmentStatus.CANCELLED },
+        status: {
+          $nin: [AppointmentStatus.CANCELLED, AppointmentStatus.EXPIRED],
+        },
       })
       .select('appointmentTime appointmentEndTime')
       .lean();
@@ -283,7 +316,9 @@ export class AppointmentValidatorService {
           $gte: startDate,
           $lt: endDate,
         },
-        status: { $ne: AppointmentStatus.CANCELLED },
+        status: {
+          $nin: [AppointmentStatus.CANCELLED, AppointmentStatus.EXPIRED],
+        },
       })
       .select('appointmentDate appointmentTime appointmentEndTime')
       .lean();

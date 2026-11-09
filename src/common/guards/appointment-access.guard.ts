@@ -104,6 +104,10 @@ export class AppointmentAccessGuard implements CanActivate {
       throw new ForbiddenException('Appointment is cancelled');
     }
 
+    if (appointment.status === AppointmentStatus.EXPIRED) {
+      throw new ForbiddenException('Appointment has expired');
+    }
+
     if (appointment.status === AppointmentStatus.PENDING) {
       throw new ForbiddenException('Appointment is still pending');
     }

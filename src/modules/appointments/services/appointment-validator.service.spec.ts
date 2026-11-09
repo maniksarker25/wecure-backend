@@ -157,7 +157,9 @@ describe('AppointmentValidatorService', () => {
         expect.objectContaining({
           doctorId: new Types.ObjectId(mockDoctorId),
           appointmentDate: { $gte: startOfDay, $lt: endOfDay },
-          status: { $ne: AppointmentStatus.CANCELLED },
+          status: {
+            $nin: [AppointmentStatus.CANCELLED, AppointmentStatus.EXPIRED],
+          },
         }),
       );
     });

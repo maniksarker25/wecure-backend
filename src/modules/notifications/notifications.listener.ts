@@ -31,18 +31,20 @@ export class NotificationsListener {
     const dateStr = new Date(appointmentDate).toLocaleDateString();
 
     // Fetch doctor profile and notify patient concurrently (in-app + push)
+    const patientMessage = `Your payment was received and your appointment for ${dateStr} at ${appointmentTime} is confirmed.`;
+    const doctorMessage = `A patient booked an appointment for ${dateStr} at ${appointmentTime}.`;
     const [, , doctorProfile] = await Promise.all([
       this.notificationsService.createInAppNotification(
         userId,
         NotificationType.APPOINTMENT_CREATED,
-        'Appointment Request Submitted',
-        `Your appointment request for ${dateStr} at ${appointmentTime} has been submitted.`,
+        'Appointment Confirmed',
+        patientMessage,
         { appointmentId: payload._id, role: 'PATIENT' },
       ),
       this.pushService.sendToUser(
         userId.toString(),
-        'Appointment Request Submitted',
-        `Your appointment request for ${dateStr} at ${appointmentTime} has been submitted.`,
+        'Appointment Confirmed',
+        patientMessage,
         {
           type: 'APPOINTMENT_CREATED',
           appointmentId: payload._id.toString(),
@@ -50,6 +52,7 @@ export class NotificationsListener {
       ),
       this.doctorModel.findById(doctorId).lean(),
     ]);
+    await this.emailUser(userId, 'Appointment Confirmed', patientMessage);
 
     if (doctorProfile) {
       // Notify doctor via in-app + push concurrently
@@ -57,14 +60,14 @@ export class NotificationsListener {
         this.notificationsService.createInAppNotification(
           doctorProfile.userId,
           NotificationType.APPOINTMENT_CREATED,
-          'New Appointment Request',
-          `You have a new appointment request for ${dateStr} at ${appointmentTime}.`,
+          'New Appointment',
+          doctorMessage,
           { appointmentId: payload._id, role: 'DOCTOR' },
         ),
         this.pushService.sendToUser(
           doctorProfile.userId.toString(),
-          'New Appointment Request',
-          `You have a new appointment request for ${dateStr} at ${appointmentTime}.`,
+          'New Appointment',
+          doctorMessage,
           {
             type: 'APPOINTMENT_CREATED',
             appointmentId: payload._id.toString(),
@@ -118,24 +121,31 @@ export class NotificationsListener {
     let messageDoctor: string | undefined;
     const doctorUserId = await this.resolveDoctorUserId(doctorId);
 
+    const when = this.visitWhen(
+      payload.appointmentDate,
+      payload.appointmentTime,
+    );
+
     switch (status) {
       case 'CANCELLED':
         type = NotificationType.APPOINTMENT_CANCELLED;
         title = 'Appointment Cancelled';
-        messagePatient = 'Your appointment has been cancelled.';
-        messageDoctor = 'An appointment has been cancelled.';
+        ({ messagePatient, messageDoctor } = this.cancellationMessages(
+          payload,
+          when,
+        ));
         break;
       case 'COMPLETED':
         type = NotificationType.APPOINTMENT_COMPLETED;
         title = 'Appointment Completed';
-        messagePatient = 'Your appointment has been marked as completed.';
-        messageDoctor = 'Appointment marked as completed.';
+        messagePatient = `Your appointment${when} is complete.`;
+        messageDoctor = `An appointment${when} is complete.`;
         break;
       case 'ONGOING': // Started
         type = NotificationType.APPOINTMENT_STARTED;
         title = 'Appointment Started';
-        messagePatient = 'Your appointment has started.';
-        messageDoctor = 'Appointment started.';
+        messagePatient = `Your appointment${when} has started.`;
+        messageDoctor = `Your appointment${when} has started.`;
         break;
       case 'UPCOMING': // Could be re-scheduled or just confirmed
         if (oldStatus === 'PENDING') {
@@ -175,7 +185,7 @@ export class NotificationsListener {
         );
       }
 
-      if (doctorUserId) {
+      if (doctorUserId && payload.notifyDoctor !== false && messageDoctor) {
         tasks.push(
           this.notificationsService.createInAppNotification(
             doctorUserId,
@@ -194,6 +204,10 @@ export class NotificationsListener {
             },
           ),
         );
+      }
+
+      if (userId && status === 'CANCELLED') {
+        tasks.push(this.emailUser(userId, title, messagePatient));
       }
 
       await Promise.all(tasks);
@@ -443,12 +457,7 @@ export class NotificationsListener {
 
   @OnEvent('appointment.accepted')
   async handleAppointmentAccepted(payload: any) {
-    const {
-      appointmentId,
-      userId,
-      appointmentDate,
-      appointmentTime,
-    } = payload;
+    const { appointmentId, userId, appointmentDate, appointmentTime } = payload;
     this.logger.log(
       `Handling appointment.accepted for appointment ${appointmentId}`,
     );
@@ -490,33 +499,38 @@ export class NotificationsListener {
 
   @OnEvent('appointment.rejected')
   async handleAppointmentRejected(payload: any) {
-    const {
-      appointmentId,
-      userId,
-      appointmentDate,
-      appointmentTime,
-      reason,
-    } = payload;
+    const { appointmentId, userId, appointmentDate, appointmentTime, reason } =
+      payload;
     this.logger.log(
       `Handling appointment.rejected for appointment ${appointmentId}`,
     );
 
     const dateStr = new Date(appointmentDate).toLocaleDateString();
     const reasonText = reason ? ` Reason: ${reason}` : '';
+    const refundText = payload.refundStarted
+      ? ' A full refund is being processed.'
+      : payload.refundFailed
+        ? ' We could not start the refund automatically. Please contact support.'
+        : '';
+    const patientMessage = `Your appointment for ${dateStr} at ${appointmentTime} was declined by the doctor.${reasonText}${refundText}`;
+    const doctorMessage = payload.refundStarted
+      ? `You declined the appointment for ${dateStr} at ${appointmentTime}. A full refund is being sent to the patient.`
+      : `You declined the appointment for ${dateStr} at ${appointmentTime}. The patient has been informed.`;
 
     const patient = await this.usersService.findById(userId);
+    const doctorUserId = await this.resolveDoctorUserId(payload.doctorId);
     const tasks: Promise<any>[] = [
       this.notificationsService.createInAppNotification(
         userId,
         NotificationType.APPOINTMENT_CANCELLED,
-        'Appointment Request Declined',
-        `Your appointment request for ${dateStr} at ${appointmentTime} was declined by the doctor.${reasonText}`,
-        { appointmentId },
+        'Appointment Declined',
+        patientMessage,
+        { appointmentId, role: 'PATIENT' },
       ),
       this.pushService.sendToUser(
         userId.toString(),
-        'Appointment Request Declined',
-        `Your appointment request for ${dateStr} at ${appointmentTime} was declined by the doctor.${reasonText}`,
+        'Appointment Declined',
+        patientMessage,
         {
           appointmentId: appointmentId.toString(),
           type: 'APPOINTMENT_REJECTED',
@@ -528,8 +542,29 @@ export class NotificationsListener {
       tasks.push(
         this.mailService.sendEmail(
           patient.email,
-          'Appointment Request Declined',
-          `Unfortunately, your appointment request for ${dateStr} at ${appointmentTime} was declined by the doctor.${reasonText}`,
+          'Appointment Declined',
+          patientMessage,
+        ),
+      );
+    }
+
+    if (doctorUserId) {
+      tasks.push(
+        this.notificationsService.createInAppNotification(
+          doctorUserId,
+          NotificationType.APPOINTMENT_CANCELLED,
+          'Appointment Declined',
+          doctorMessage,
+          { appointmentId, role: 'DOCTOR' },
+        ),
+        this.pushService.sendToUser(
+          doctorUserId,
+          'Appointment Declined',
+          doctorMessage,
+          {
+            appointmentId: appointmentId.toString(),
+            type: 'APPOINTMENT_REJECTED',
+          },
         ),
       );
     }
@@ -601,6 +636,96 @@ export class NotificationsListener {
     );
   }
 
+  private visitWhen(date?: Date | string, time?: string) {
+    if (!date || !time) return '';
+    return ` for ${new Date(date).toLocaleDateString()} at ${time}`;
+  }
+
+  private money(amount?: number) {
+    if (
+      amount === undefined ||
+      amount === null ||
+      Number.isNaN(Number(amount))
+    ) {
+      return '';
+    }
+    return `NGN ${amount}`;
+  }
+
+  private cancellationMessages(payload: any, when: string) {
+    const amountText = this.money(payload.refundAmount);
+    const refundSentence = payload.refundStarted
+      ? amountText
+        ? ` A refund of ${amountText} is being processed.`
+        : ' A refund is being processed.'
+      : payload.refundFailed
+        ? ' We could not start the refund automatically. Please contact support.'
+        : '';
+
+    if (payload.cancelledBy === 'PATIENT') {
+      return {
+        messagePatient: payload.refundStarted
+          ? `You cancelled your appointment${when}.${refundSentence}`
+          : payload.refundFailed
+            ? `You cancelled your appointment${when}.${refundSentence}`
+            : payload.hadPayment
+              ? `You cancelled your appointment${when}. The visit time has passed, so this payment is not refunded.`
+              : `You cancelled your appointment${when}.`,
+        messageDoctor: payload.refundStarted
+          ? `The patient cancelled the appointment${when}. Their payment is being refunded.`
+          : `The patient cancelled the appointment${when}.`,
+      };
+    }
+
+    if (payload.cancelledBy === 'DOCTOR_UNAVAILABLE') {
+      return {
+        messagePatient: payload.refundStarted
+          ? `Your appointment${when} was cancelled because the doctor is no longer available. A full refund is being processed.`
+          : `Your appointment${when} was cancelled because the doctor is no longer available.`,
+        messageDoctor:
+          'An appointment was cancelled because the doctor is unavailable.',
+      };
+    }
+
+    if (payload.cancelledBy === 'DOCTOR') {
+      return {
+        messagePatient: payload.refundStarted
+          ? `The doctor cancelled your appointment${when}. A full refund is being processed.`
+          : payload.refundFailed
+            ? `The doctor cancelled your appointment${when}. We could not start the refund automatically. Please contact support.`
+            : `The doctor cancelled your appointment${when}.`,
+        messageDoctor: payload.refundStarted
+          ? `You cancelled the appointment${when}. A full refund is being sent to the patient.`
+          : `You cancelled the appointment${when}. The patient has been informed.`,
+      };
+    }
+
+    return {
+      messagePatient: `Your appointment${when} has been cancelled.${refundSentence}`,
+      messageDoctor: `An appointment${when} has been cancelled.`,
+    };
+  }
+
+  private async emailUser(userId: any, subject: string, body: string) {
+    try {
+      const id = userId?._id || userId;
+      if (!id) return;
+      const user = await this.usersService.findById(id.toString());
+      if (user?.email) {
+        await this.mailService.sendEmail(user.email, subject, body);
+      }
+    } catch (error) {
+      this.logger.error(`Failed to email user ${userId}`, error);
+    }
+  }
+
+  private doctorUserForConfirmedRefund(payload: any) {
+    if (!payload.doctorId || payload.reason === 'BOOKING_EXPIRED') {
+      return Promise.resolve(null);
+    }
+    return this.resolveDoctorUserId(payload.doctorId);
+  }
+
   private async resolveDoctorUserId(doctorId: any): Promise<string | null> {
     if (!doctorId) {
       return null;
@@ -620,6 +745,248 @@ export class NotificationsListener {
     }
 
     return doctorProfile.userId.toString();
+  }
+
+  @OnEvent('appointment.payment_confirmed')
+  async handleAppointmentPaymentConfirmed(payload: any) {
+    const userId = payload.userId;
+    const doctorUserId = await this.resolveDoctorUserId(payload.doctorId);
+    const dateStr = new Date(payload.appointmentDate).toLocaleDateString();
+    const patientMessage = `Your payment was received and your appointment for ${dateStr} at ${payload.appointmentTime} is confirmed.`;
+    const doctorMessage = `A patient payment was confirmed for ${dateStr} at ${payload.appointmentTime}.`;
+
+    const tasks: Promise<any>[] = [];
+    if (userId) {
+      tasks.push(
+        this.notificationsService.createInAppNotification(
+          userId,
+          NotificationType.APPOINTMENT_PAYMENT_CONFIRMED,
+          'Appointment Confirmed',
+          patientMessage,
+          { appointmentId: payload._id, role: 'PATIENT' },
+        ),
+        this.pushService.sendToUser(
+          userId.toString(),
+          'Appointment Confirmed',
+          patientMessage,
+          {
+            type: NotificationType.APPOINTMENT_PAYMENT_CONFIRMED,
+            appointmentId: payload._id.toString(),
+          },
+        ),
+      );
+    }
+    if (doctorUserId) {
+      tasks.push(
+        this.notificationsService.createInAppNotification(
+          doctorUserId,
+          NotificationType.APPOINTMENT_PAYMENT_CONFIRMED,
+          'Appointment Confirmed',
+          doctorMessage,
+          { appointmentId: payload._id, role: 'DOCTOR' },
+        ),
+        this.pushService.sendToUser(
+          doctorUserId,
+          'Appointment Confirmed',
+          doctorMessage,
+          {
+            type: NotificationType.APPOINTMENT_PAYMENT_CONFIRMED,
+            appointmentId: payload._id.toString(),
+          },
+        ),
+      );
+    }
+    await Promise.all(tasks);
+  }
+
+  @OnEvent('appointment.expired_refund')
+  async handleExpiredAppointmentRefund(payload: any) {
+    const userId = payload.userId;
+    if (!userId) return;
+
+    const when = this.visitWhen(
+      payload.appointmentDate,
+      payload.appointmentTime,
+    );
+    const amountText = this.money(payload.amount);
+    const message = `Your booking${when} expired before it could be confirmed. The time is no longer held, and ${amountText ? `a refund of ${amountText} is being processed` : 'your payment is being refunded'}.`;
+
+    await Promise.all([
+      this.notificationsService.createInAppNotification(
+        userId,
+        NotificationType.APPOINTMENT_EXPIRED_REFUND,
+        'Booking Expired',
+        message,
+        { appointmentId: payload.appointmentId, role: 'PATIENT' },
+      ),
+      this.pushService.sendToUser(
+        userId.toString(),
+        'Booking Expired',
+        message,
+        {
+          type: NotificationType.APPOINTMENT_EXPIRED_REFUND,
+          appointmentId: payload.appointmentId.toString(),
+        },
+      ),
+      this.emailUser(userId, 'Booking Expired', message),
+    ]);
+  }
+
+  @OnEvent('appointment.refund_completed')
+  async handleRefundCompleted(payload: any) {
+    if (!payload.userId) return;
+    const amountText = this.money(payload.amount);
+    const message = amountText
+      ? `Your refund of ${amountText} has been completed and is on its way back to your account.`
+      : 'Your refund has been completed and is on its way back to your account.';
+    const tasks: Promise<any>[] = [
+      this.notificationsService.createInAppNotification(
+        payload.userId,
+        NotificationType.APPOINTMENT_EXPIRED_REFUND,
+        'Refund Completed',
+        message,
+        { appointmentId: payload.appointmentId, role: 'PATIENT' },
+      ),
+      this.pushService.sendToUser(
+        payload.userId.toString(),
+        'Refund Completed',
+        message,
+        {
+          type: NotificationType.APPOINTMENT_EXPIRED_REFUND,
+          appointmentId: payload.appointmentId?.toString(),
+        },
+      ),
+      this.emailUser(payload.userId, 'Refund Completed', message),
+    ];
+    const doctorUserId = await this.doctorUserForConfirmedRefund(payload);
+    if (doctorUserId) {
+      const doctorMessage = amountText
+        ? `The patient's refund of ${amountText} has been completed. You will not be paid for that visit.`
+        : 'The patient refund has been completed. You will not be paid for that visit.';
+      tasks.push(
+        this.notificationsService.createInAppNotification(
+          doctorUserId,
+          NotificationType.APPOINTMENT_EXPIRED_REFUND,
+          'Refund Completed',
+          doctorMessage,
+          { appointmentId: payload.appointmentId, role: 'DOCTOR' },
+        ),
+        this.pushService.sendToUser(
+          doctorUserId,
+          'Refund Completed',
+          doctorMessage,
+          {
+            type: NotificationType.APPOINTMENT_EXPIRED_REFUND,
+            appointmentId: payload.appointmentId?.toString(),
+          },
+        ),
+      );
+    }
+    await Promise.all(tasks);
+  }
+
+  @OnEvent('appointment.refund_failed')
+  async handleRefundFailed(payload: any) {
+    if (!payload.userId) return;
+    const message =
+      'We could not complete your refund automatically. Please contact support so we can return the payment.';
+    const tasks: Promise<any>[] = [
+      this.notificationsService.createInAppNotification(
+        payload.userId,
+        NotificationType.APPOINTMENT_EXPIRED_REFUND,
+        'Refund Needs Help',
+        message,
+        { appointmentId: payload.appointmentId, role: 'PATIENT' },
+      ),
+      this.pushService.sendToUser(
+        payload.userId.toString(),
+        'Refund Needs Help',
+        message,
+        {
+          type: NotificationType.APPOINTMENT_EXPIRED_REFUND,
+          appointmentId: payload.appointmentId?.toString(),
+        },
+      ),
+      this.emailUser(payload.userId, 'Refund Needs Help', message),
+    ];
+    const doctorUserId = await this.doctorUserForConfirmedRefund(payload);
+    if (doctorUserId) {
+      const doctorMessage =
+        'The patient refund could not be completed automatically. Support needs to return the payment.';
+      tasks.push(
+        this.notificationsService.createInAppNotification(
+          doctorUserId,
+          NotificationType.APPOINTMENT_EXPIRED_REFUND,
+          'Refund Needs Help',
+          doctorMessage,
+          { appointmentId: payload.appointmentId, role: 'DOCTOR' },
+        ),
+        this.pushService.sendToUser(
+          doctorUserId,
+          'Refund Needs Help',
+          doctorMessage,
+          {
+            type: NotificationType.APPOINTMENT_EXPIRED_REFUND,
+            appointmentId: payload.appointmentId?.toString(),
+          },
+        ),
+      );
+    }
+    await Promise.all(tasks);
+  }
+
+  @OnEvent('appointment.hold_expired')
+  async handleHoldExpired(payload: any) {
+    if (!payload.userId) return;
+    const when = this.visitWhen(
+      payload.appointmentDate,
+      payload.appointmentTime,
+    );
+    const message = `Your unpaid booking${when} expired because payment was not completed within 10 minutes. The time has been released.`;
+    await Promise.all([
+      this.notificationsService.createInAppNotification(
+        payload.userId,
+        NotificationType.APPOINTMENT_HOLD_EXPIRED,
+        'Booking Hold Expired',
+        message,
+        { appointmentId: payload.appointmentId, role: 'PATIENT' },
+      ),
+      this.pushService.sendToUser(
+        payload.userId.toString(),
+        'Booking Hold Expired',
+        message,
+        {
+          type: NotificationType.APPOINTMENT_HOLD_EXPIRED,
+          appointmentId: payload.appointmentId?.toString(),
+        },
+      ),
+      this.emailUser(payload.userId, 'Booking Hold Expired', message),
+    ]);
+  }
+
+  @OnEvent('appointment.schedule_cleared')
+  async handleScheduleCleared(payload: any) {
+    if (!payload.doctorUserId) return;
+    const count = Number(payload.count) || 0;
+    const message =
+      count === 1
+        ? '1 upcoming appointment was cancelled because your account is no longer available to patients. Paid visits are being refunded.'
+        : `${count} upcoming appointments were cancelled because your account is no longer available to patients. Paid visits are being refunded.`;
+    await Promise.all([
+      this.notificationsService.createInAppNotification(
+        payload.doctorUserId,
+        NotificationType.APPOINTMENT_CANCELLED,
+        'Appointments Cancelled',
+        message,
+        { role: 'DOCTOR' },
+      ),
+      this.pushService.sendToUser(
+        payload.doctorUserId.toString(),
+        'Appointments Cancelled',
+        message,
+        { type: NotificationType.APPOINTMENT_CANCELLED },
+      ),
+    ]);
   }
 
   @OnEvent('user.profile_updated')

@@ -8,6 +8,8 @@ import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { ConfigService } from '@nestjs/config';
 import { Types } from 'mongoose';
 import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
+import { NotificationsService } from '../notifications/notifications.service';
+import { Appointment } from '../appointments/schemas/appointment.schema';
 
 describe('RefundsService', () => {
   let service: RefundsService;
@@ -63,6 +65,14 @@ describe('RefundsService', () => {
         {
           provide: ConfigService,
           useValue: { get: jest.fn() },
+        },
+        {
+          provide: NotificationsService,
+          useValue: { emit: jest.fn() },
+        },
+        {
+          provide: getModelToken(Appointment.name),
+          useValue: { findById: jest.fn() },
         },
       ],
     }).compile();

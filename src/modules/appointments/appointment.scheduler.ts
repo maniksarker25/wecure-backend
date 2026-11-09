@@ -1,25 +1,21 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { Model, Types } from 'mongoose';
+import { Model } from 'mongoose';
 import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
 import { combineDateAndTime } from 'src/common/utils/business-time.util';
 import { NotificationsService } from 'src/modules/notifications/notifications.service';
-import { Payment, PaymentDocument } from '../payments/schemas/payment.schema';
 import { Appointment, AppointmentDocument } from './schemas/appointment.schema';
 
 @Injectable()
 export class AppointmentSchedulerService {
   private readonly logger = new Logger(AppointmentSchedulerService.name);
 
-  private readonly unpaidHoldMs = 4 * 60 * 1000;
-  private readonly checkoutHoldMs = 24 * 60 * 60 * 1000;
+  private readonly checkoutHoldMs = 10 * 60 * 1000;
 
   constructor(
     @InjectModel(Appointment.name)
     private appointmentModel: Model<AppointmentDocument>,
-    @InjectModel(Payment.name)
-    private paymentModel: Model<PaymentDocument>,
     private readonly notificationsService: NotificationsService,
   ) {}
 
@@ -28,7 +24,7 @@ export class AppointmentSchedulerService {
     this.logger.verbose('Running appointment status transition job...');
 
     const now = new Date();
-    await this.releaseAbandonedPendingAppointments(now);
+    await this.expireUnpaidAppointments(now);
 
     // Transition candidates: exact start/end instants are resolved per-document below
     // using the absolute UTC fields if set, otherwise falling back to doctor's timezone.
@@ -68,82 +64,112 @@ export class AppointmentSchedulerService {
           );
 
       if (now > end) {
-        toCompleted.push(appt._id);
+        toCompleted.push(appt);
       } else if (appt.status === AppointmentStatus.UPCOMING && now >= start) {
-        toOngoing.push(appt._id);
+        toOngoing.push(appt);
       }
     }
 
     if (toOngoing.length > 0) {
       const upcomingResult = await this.appointmentModel.updateMany(
-        { _id: { $in: toOngoing } },
+        { _id: { $in: toOngoing.map((appointment) => appointment._id) } },
         { $set: { status: AppointmentStatus.ONGOING } },
       );
       this.logger.log(
         `Transitioned ${upcomingResult.modifiedCount} appointments to ONGOING`,
       );
+      if (upcomingResult.modifiedCount > 0) {
+        this.emitStatusChanges(
+          toOngoing,
+          AppointmentStatus.ONGOING,
+          AppointmentStatus.UPCOMING,
+        );
+      }
     }
 
     if (toCompleted.length > 0) {
       const ongoingResult = await this.appointmentModel.updateMany(
-        { _id: { $in: toCompleted } },
+        { _id: { $in: toCompleted.map((appointment) => appointment._id) } },
         { $set: { status: AppointmentStatus.COMPLETED } },
       );
       this.logger.log(
         `Transitioned ${ongoingResult.modifiedCount} appointments to COMPLETED`,
       );
+      if (ongoingResult.modifiedCount > 0) {
+        this.emitStatusChanges(
+          toCompleted,
+          AppointmentStatus.COMPLETED,
+          AppointmentStatus.ONGOING,
+        );
+      }
     }
   }
 
-  private async releaseAbandonedPendingAppointments(now: Date) {
-    const unpaidCutoff = new Date(now.getTime() - this.unpaidHoldMs);
-    const checkoutCutoff = new Date(now.getTime() - this.checkoutHoldMs);
-    const stale = await this.appointmentModel
+  private async expireUnpaidAppointments(now: Date) {
+    const cutoff = new Date(now.getTime() - this.checkoutHoldMs);
+    const due = await this.appointmentModel
       .find({
         status: AppointmentStatus.PENDING,
-        createdAt: { $lt: unpaidCutoff },
+        createdAt: { $lt: cutoff },
       })
-      .select('_id createdAt')
-      .lean<Array<{ _id: Types.ObjectId; createdAt?: Date }>>();
+      .select('userId appointmentDate appointmentTime')
+      .lean();
 
-    if (stale.length === 0) {
+    if (due.length === 0) {
       return;
     }
 
-    const payments = await this.paymentModel
-      .find({
-        appointmentId: { $in: stale.map((appointment) => appointment._id) },
-      })
-      .select('appointmentId')
-      .lean<Array<{ appointmentId: Types.ObjectId }>>();
-    const withPayment = new Set(
-      payments.map((payment) => payment.appointmentId.toString()),
+    const result = await this.appointmentModel.updateMany(
+      {
+        _id: { $in: due.map((appointment) => appointment._id) },
+        status: AppointmentStatus.PENDING,
+      },
+      {
+        $set: {
+          status: AppointmentStatus.EXPIRED,
+          expiredAt: now,
+        },
+      },
     );
-    const deletableIds = stale
-      .filter((appointment) => {
-        if (!withPayment.has(appointment._id.toString())) {
-          return true;
-        }
-        const createdAt = appointment.createdAt
-          ? new Date(appointment.createdAt)
-          : now;
-        return createdAt < checkoutCutoff;
-      })
-      .map((appointment) => appointment._id);
 
-    if (deletableIds.length === 0) {
-      return;
-    }
-
-    const result = await this.appointmentModel.deleteMany({
-      _id: { $in: deletableIds },
-      status: AppointmentStatus.PENDING,
-    });
-
-    if (result.deletedCount > 0) {
+    if (result.modifiedCount > 0) {
       this.logger.log(
-        `Removed ${result.deletedCount} abandoned pending appointments`,
+        `Expired ${result.modifiedCount} unpaid appointments after 10 minutes`,
       );
+      for (const appointment of due) {
+        this.notificationsService.emit('appointment.hold_expired', {
+          appointmentId: appointment._id,
+          userId: appointment.userId,
+          appointmentDate: appointment.appointmentDate,
+          appointmentTime: appointment.appointmentTime,
+        });
+      }
+    }
+  }
+
+  private emitStatusChanges(
+    appointments: Array<{
+      _id: unknown;
+      userId?: unknown;
+      doctorId?: unknown;
+      appointmentDate?: Date;
+      appointmentTime?: string;
+    }>,
+    status: AppointmentStatus,
+    oldStatus: AppointmentStatus,
+  ) {
+    for (const appointment of appointments) {
+      const doctor = appointment.doctorId as { _id?: unknown } | undefined;
+      const patient = appointment.userId as { _id?: unknown } | undefined;
+      this.notificationsService.emit('appointment.status_change', {
+        appointmentId: appointment._id,
+        status,
+        oldStatus,
+        userId: patient?._id || appointment.userId,
+        doctorId: doctor?._id || appointment.doctorId,
+        appointmentDate: appointment.appointmentDate,
+        appointmentTime: appointment.appointmentTime,
+      });
     }
   }
 

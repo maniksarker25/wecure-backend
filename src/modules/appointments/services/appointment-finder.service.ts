@@ -52,7 +52,9 @@ export class AppointmentFinderService {
     if (status) {
       matchStage.status = status;
     } else {
-      matchStage.status = { $ne: AppointmentStatus.PENDING };
+      matchStage.status = {
+        $nin: [AppointmentStatus.PENDING, AppointmentStatus.EXPIRED],
+      };
     }
 
     const pipeline: any[] = [
@@ -218,7 +220,9 @@ export class AppointmentFinderService {
       {
         $match: {
           doctorId: doctorObjectId,
-          status: { $ne: AppointmentStatus.PENDING },
+          status: {
+            $nin: [AppointmentStatus.PENDING, AppointmentStatus.EXPIRED],
+          },
         },
       },
       { $sort: { appointmentDate: -1 } },

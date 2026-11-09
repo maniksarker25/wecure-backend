@@ -112,7 +112,7 @@ export class RefundsController {
     if (
       user.role !== 'ADMIN' &&
       refund.userId.toString() !== user.userId &&
-      refund.doctorId.toString() !== user.userId
+      refund.doctorId?.toString() !== user.userId
     ) {
       throw new ForbiddenException(
         'You do not have permission to view this refund',

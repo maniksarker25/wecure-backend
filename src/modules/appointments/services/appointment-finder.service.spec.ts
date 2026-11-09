@@ -133,7 +133,7 @@ describe('AppointmentFinderService', () => {
           expect.objectContaining({
             $match: {
               userId: new Types.ObjectId(mockUserId),
-              status: { $ne: 'PENDING' },
+              status: { $nin: ['PENDING', 'EXPIRED'] },
             },
           }),
           expect.objectContaining({
