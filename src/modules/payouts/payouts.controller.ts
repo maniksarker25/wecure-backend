@@ -7,12 +7,18 @@ import {
   Query,
   Body,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { PayoutFinderService } from './services/payout-finder.service';
 import { PayoutManagerService } from './services/payout-manager.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from 'src/common/decorators/roles.decorator';
 import { Role } from 'src/common/enum/role.enum';
+import {
+  buildPayoutBatchId,
+  resolvePayoutSchedule,
+  resolvePayoutTimezone,
+} from './payout-schedule';
 
 @Controller('payouts')
 @UseGuards(JwtAuthGuard)
@@ -20,6 +26,7 @@ export class PayoutsController {
   constructor(
     private readonly payoutFinder: PayoutFinderService,
     private readonly payoutManager: PayoutManagerService,
+    private readonly configService: ConfigService,
   ) {}
 
   @Get('admin/due')
@@ -42,9 +49,7 @@ export class PayoutsController {
   @UseGuards(RolesGuard)
   @Roles(Role.ADMIN)
   async createPayoutBatch(@Body() body: { batchId?: string }) {
-    // Manual trigger for testing or ad-hoc payouts
-    const batchId =
-      (body && body.batchId) || new Date().toISOString().slice(0, 7); // Default to YYYY-MM
+    const batchId = body?.batchId || this.currentBatchId();
     return this.payoutManager.createPayoutBatch(batchId);
   }
 
@@ -53,6 +58,16 @@ export class PayoutsController {
   @Roles(Role.ADMIN)
   async processPayout(@Param('payoutId') payoutId: string) {
     return this.payoutManager.processPayout(payoutId);
+  }
+
+  private currentBatchId() {
+    const schedule =
+      resolvePayoutSchedule(this.configService.get('PAYOUT_SCHEDULE')) ??
+      'WEEKLY';
+    const { timezone } = resolvePayoutTimezone(
+      this.configService.get('PAYOUT_TIMEZONE'),
+    );
+    return buildPayoutBatchId(schedule, new Date(), timezone);
   }
 }
 
