@@ -28,29 +28,35 @@ describe('AuthService', () => {
     _id: 'doctor123',
     userId: 'user123',
     verificationStatus: 'PENDING',
+    isProfileComplete: true,
+    isVerified: false,
+    currentOrganization: 'Lagos Clinic',
+    specialtyId: 'specialty-1',
+    mdcnRegistrationNumber: 'MDCN-123',
+    mdcnPracticingLicenseDocument: 'licence-key',
+    mdcnPracticingLicenseExpiryDate: new Date('2099-01-01T00:00:00.000Z'),
+    save: jest.fn().mockResolvedValue(undefined),
   };
 
   beforeEach(async () => {
+    mockDoctor.verificationStatus = 'PENDING';
+    mockDoctor.isProfileComplete = true;
+    mockDoctor.isVerified = false;
+    mockDoctor.currentOrganization = 'Lagos Clinic';
+    mockDoctor.mdcnPracticingLicenseDocument = 'licence-key';
+    mockDoctor.mdcnPracticingLicenseExpiryDate = new Date(
+      '2099-01-01T00:00:00.000Z',
+    );
     usersService = {
       findByEmail: jest.fn().mockResolvedValue(mockUser),
       updateRefreshToken: jest.fn().mockResolvedValue(undefined),
+      linkDoctorProfile: jest.fn().mockResolvedValue(undefined),
     };
 
     doctorModel = {
-      findOne: jest.fn().mockReturnValue({
-        exec: jest.fn().mockResolvedValue(mockDoctor),
-      }),
+      findOne: jest.fn().mockResolvedValue(mockDoctor),
+      create: jest.fn(),
     };
-
-    // For findOne without exec if that's how it's used
-    doctorModel.findOne = jest.fn().mockImplementation((query) => {
-      return {
-        exec: jest.fn().mockResolvedValue(mockDoctor),
-        ...mockDoctor, // Fallback for direct return
-        _id: 'doctor123',
-        verificationStatus: mockDoctor.verificationStatus,
-      };
-    });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -79,26 +85,27 @@ describe('AuthService', () => {
   });
 
   describe('login', () => {
-    it('should throw UnauthorizedException if doctor status is PENDING', async () => {
-      mockDoctor.verificationStatus = 'PENDING';
-      await expect(
-        service.login('doctor@example.com', 'password'),
-      ).rejects.toThrow(
-        new UnauthorizedException(
-          'Your account is pending verification. Please wait for admin approval.',
-        ),
-      );
+    it('allows a doctor with an incomplete profile to sign in for onboarding', async () => {
+      mockDoctor.verificationStatus = 'INCOMPLETE';
+      mockDoctor.isProfileComplete = false;
+      mockDoctor.currentOrganization = '';
+
+      const result = await service.login('doctor@example.com', 'password');
+
+      expect(result.verificationStatus).toBe('INCOMPLETE');
+      expect(result.isProfileComplete).toBe(false);
+      expect(result.doctorId).toBe('doctor123');
     });
 
-    it('should throw UnauthorizedException if doctor status is REJECTED', async () => {
+    it('allows a pending or rejected doctor to sign in', async () => {
+      mockDoctor.verificationStatus = 'PENDING';
+      const pending = await service.login('doctor@example.com', 'password');
+      expect(pending.verificationStatus).toBe('PENDING');
+      expect(pending.isProfileComplete).toBe(true);
+
       mockDoctor.verificationStatus = 'REJECTED';
-      await expect(
-        service.login('doctor@example.com', 'password'),
-      ).rejects.toThrow(
-        new UnauthorizedException(
-          'Your account has been rejected. Please contact support.',
-        ),
-      );
+      const rejected = await service.login('doctor@example.com', 'password');
+      expect(rejected.verificationStatus).toBe('REJECTED');
     });
 
     it('should throw UnauthorizedException if doctor status is SUSPENDED', async () => {
@@ -112,11 +119,43 @@ describe('AuthService', () => {
       );
     });
 
+    it('creates the doctor profile when email verification finishes', async () => {
+      doctorModel.findOne.mockResolvedValue(null);
+      doctorModel.create.mockResolvedValue({
+        _id: 'doctor123',
+        userId: mockUser._id,
+        verificationStatus: 'INCOMPLETE',
+        isProfileComplete: false,
+        isVerified: false,
+        save: jest.fn(),
+      });
+      (usersService as any).verifyEmailVerificationOtp = jest
+        .fn()
+        .mockResolvedValue(true);
+
+      const result = await service.verifyRegistrationOtp(
+        'doctor@example.com',
+        '123456',
+      );
+
+      expect(doctorModel.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          isProfileComplete: false,
+          verificationStatus: 'INCOMPLETE',
+        }),
+      );
+      expect(result.doctorId).toBe('doctor123');
+      expect(result.isProfileComplete).toBe(false);
+    });
+
     it('should allow login if doctor status is VERIFIED', async () => {
       mockDoctor.verificationStatus = 'VERIFIED';
+      mockDoctor.isVerified = true;
       const result = await service.login('doctor@example.com', 'password');
       expect(result).toBeDefined();
       expect(result.email).toBe('doctor@example.com');
+      expect(result.verificationStatus).toBe('VERIFIED');
+      expect(result.isProfileComplete).toBe(true);
     });
   });
 });

@@ -2,14 +2,23 @@ import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { ConfigService } from '@nestjs/config';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
+import { Role } from 'src/common/enum/role.enum';
 import { UsersService } from 'src/modules/users/users.service';
 import { UserStatus } from 'src/common/enum/user.status.enum';
+import {
+  Doctor,
+  DoctorDocument,
+} from 'src/modules/doctors/schemas/doctor.schema';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
     private readonly config: ConfigService,
     private readonly usersService: UsersService,
+    @InjectModel(Doctor.name)
+    private readonly doctorModel: Model<DoctorDocument>,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -41,13 +50,29 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     // Check user status with specific error messages
+    let doctorId: string | undefined;
+    if (user.role === Role.DOCTOR) {
+      const doctor = await this.doctorModel
+        .findOne({ userId: user._id })
+        .select('_id verificationStatus')
+        .lean();
+      if (doctor?.verificationStatus === 'SUSPENDED') {
+        throw new UnauthorizedException(
+          'Your account has been suspended. Please contact support.',
+        );
+      }
+      if (doctor?._id) {
+        doctorId = doctor._id.toString();
+      }
+    }
+
     switch (user.status) {
       case UserStatus.ACTIVE:
         return {
           userId: payload.userId,
           email: payload.email,
           role: payload.role,
-          ...(payload.doctorId && { doctorId: payload.doctorId }),
+          ...(doctorId ? { doctorId } : {}),
         };
       case UserStatus.PENDING:
         throw new UnauthorizedException('Account is pending approval');

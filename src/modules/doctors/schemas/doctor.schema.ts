@@ -8,11 +8,11 @@ export class Doctor {
   @Prop({ type: Types.ObjectId, ref: 'User', unique: true })
   userId: Types.ObjectId;
 
-  @Prop({ required: true })
-  currentOrganization: string;
+  @Prop()
+  currentOrganization?: string;
 
-  @Prop({ type: Types.ObjectId, ref: 'Specialist', required: true })
-  specialtyId: Types.ObjectId;
+  @Prop({ type: Types.ObjectId, ref: 'Specialist' })
+  specialtyId?: Types.ObjectId;
 
   @Prop()
   experienceYears: number;
@@ -55,10 +55,13 @@ export class Doctor {
 
   @Prop({
     type: String,
-    enum: ['PENDING', 'VERIFIED', 'REJECTED', 'SUSPENDED'],
-    default: 'PENDING',
+    enum: ['INCOMPLETE', 'PENDING', 'VERIFIED', 'REJECTED', 'SUSPENDED'],
+    default: 'INCOMPLETE',
   })
   verificationStatus: string;
+
+  @Prop({ default: false })
+  isProfileComplete: boolean;
 
   @Prop()
   verificationNote?: string;

@@ -178,6 +178,10 @@ export class UsersService {
     return user;
   }
 
+  async linkDoctorProfile(userId: string, doctorId: string) {
+    await this.userModel.findByIdAndUpdate(userId, { doctorId });
+  }
+
   async updateRefreshToken(userId: string, refreshToken: string | null) {
     const hashedRefreshToken = refreshToken
       ? await bcrypt.hash(refreshToken, 11)

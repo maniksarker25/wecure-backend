@@ -86,7 +86,10 @@ describe('DoctorManagementService', () => {
         },
         {
           provide: UsersService,
-          useValue: {},
+          useValue: {
+            linkDoctorProfile: jest.fn(),
+            updateProfile: jest.fn(),
+          },
         },
         {
           provide: PublicUploadService,
@@ -137,6 +140,9 @@ describe('DoctorManagementService', () => {
         userId: 'user123',
         currentOrganization: 'Clinic',
         specialtyId: '64f0c0f0c0f0c0f0c0f0c0f0',
+        isProfileComplete: false,
+        verificationStatus: 'INCOMPLETE',
+        isVerified: false,
       });
     });
 

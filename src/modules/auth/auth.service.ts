@@ -13,6 +13,10 @@ import { Role } from 'src/common/enum/role.enum';
 import { UserStatus } from 'src/common/enum/user.status.enum';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import {
+  isDoctorProfileComplete,
+  resolveVerificationStatus,
+} from '../doctors/doctor-onboarding';
 import { Doctor, DoctorDocument } from '../doctors/schemas/doctor.schema';
 
 @Injectable()
@@ -35,22 +39,7 @@ export class AuthService {
     timezone?: string;
   }) {
     const user = await this.usersService.createUser(data);
-    const tokens = await this.generateToken(
-      user._id.toString(),
-      user.role,
-      user.email,
-      user.doctorId,
-    );
-    await this.usersService.updateRefreshToken(
-      user._id.toString(),
-      tokens.refreshToken,
-    );
-    return {
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      ...tokens,
-    };
+    return this.issueSession(user);
   }
 
   async login(email: string, password: string) {
@@ -70,59 +59,104 @@ export class AuthService {
     const match = await bcrypt.compare(password, user.password);
     if (!match) throw new UnauthorizedException('Invalid credentials');
 
-    await this.validateDoctorStatus(user);
+    return this.issueSession(user);
+  }
 
+  private async issueSession(user: any) {
+    const doctor = await this.prepareDoctorAccount(user);
     const tokens = await this.generateToken(
       user._id.toString(),
       user.role,
       user.email,
-      user.doctorId,
+      doctor?._id?.toString(),
     );
     await this.usersService.updateRefreshToken(
       user._id.toString(),
       tokens.refreshToken,
     );
-    await this.validateDoctorStatus(user);
 
     return {
       name: user.name,
       email: user.email,
       role: user.role,
       ...tokens,
+      ...(doctor
+        ? {
+            doctorId: doctor._id.toString(),
+            isProfileComplete: !!doctor.isProfileComplete,
+            verificationStatus: doctor.verificationStatus,
+          }
+        : {}),
     };
   }
 
-  private async validateDoctorStatus(user: any) {
+  private async prepareDoctorAccount(user: any) {
     if (user.status === UserStatus.BLOCKED) {
       throw new UnauthorizedException('Account blocked');
     }
+    if (user.role !== Role.DOCTOR) return null;
 
-    if (user.role === Role.DOCTOR) {
-      const doctor = await this.doctorModel.findOne({
-        userId: user._id.toString(),
-      });
-      if (doctor) {
-        if (doctor.verificationStatus === 'PENDING') {
-          throw new UnauthorizedException(
-            'Your account is pending verification. Please wait for admin approval.',
-          );
+    const userId = user._id.toString();
+    let doctor =
+      (await this.doctorModel.findOne({ userId })) ||
+      (await this.doctorModel.findOne({ userId: user._id }));
+
+    if (!doctor) {
+      try {
+        doctor = await this.doctorModel.create({
+          userId: user._id,
+          isProfileComplete: false,
+          verificationStatus: 'INCOMPLETE',
+          isVerified: false,
+        });
+      } catch (error) {
+        if (
+          typeof error === 'object' &&
+          error !== null &&
+          'code' in error &&
+          (error as { code?: number }).code === 11000
+        ) {
+          doctor = await this.doctorModel.findOne({ userId });
+        } else {
+          throw error;
         }
-        if (doctor.verificationStatus === 'REJECTED') {
-          throw new UnauthorizedException(
-            'Your account has been rejected. Please contact support.',
-          );
-        }
-        if (doctor.verificationStatus === 'SUSPENDED') {
-          throw new UnauthorizedException(
-            'Your account has been suspended. Please contact support.',
-          );
-        }
-      } else if (user.status === UserStatus.PENDING) {
-        throw new UnauthorizedException(
-          'Your account is pending verification. Please wait for admin approval.',
-        );
       }
     }
+
+    if (!doctor) {
+      throw new UnauthorizedException('Doctor profile could not be created');
+    }
+
+    if (doctor.verificationStatus === 'SUSPENDED') {
+      throw new UnauthorizedException(
+        'Your account has been suspended. Please contact support.',
+      );
+    }
+
+    const complete = isDoctorProfileComplete(doctor);
+    const nextStatus = resolveVerificationStatus(
+      doctor.verificationStatus,
+      complete,
+    );
+    const nextVerified = nextStatus === 'VERIFIED';
+    if (
+      doctor.isProfileComplete !== complete ||
+      doctor.verificationStatus !== nextStatus ||
+      doctor.isVerified !== nextVerified
+    ) {
+      doctor.isProfileComplete = complete;
+      doctor.verificationStatus = nextStatus;
+      doctor.isVerified = nextVerified;
+      if (typeof doctor.save === 'function') {
+        await doctor.save();
+      }
+    }
+
+    if (user.doctorId !== doctor._id.toString()) {
+      await this.usersService.linkDoctorProfile(userId, doctor._id.toString());
+    }
+
+    return doctor;
   }
 
   async resendRegistrationOtp(email: string) {
@@ -189,32 +223,21 @@ export class AuthService {
     );
     if (!refreshTokenMatches) throw new ForbiddenException('Access Denied');
 
-    await this.validateDoctorStatus(user);
-
-    const tokens = await this.generateToken(
-      user._id.toString(),
-      user.role,
-      user.email,
-    );
-    await this.usersService.updateRefreshToken(
-      user._id.toString(),
-      tokens.refreshToken,
-    );
-    return tokens;
+    return this.issueSession(user);
   }
 
   private async generateToken(
     userId: string,
     role: string,
     email: string,
-    providedDoctorId?: string,
+    doctorId?: string,
   ) {
-    let doctorId: string | null = providedDoctorId || null;
+    let resolvedDoctorId = doctorId || null;
 
-    if (!doctorId && role === Role.DOCTOR) {
-      const doctor = await this.doctorModel.findOne({ userId });
+    if (!resolvedDoctorId && role === Role.DOCTOR) {
+      const doctor = await this.doctorModel.findOne({ userId }).select('_id');
       if (doctor) {
-        doctorId = doctor._id.toString();
+        resolvedDoctorId = doctor._id.toString();
       }
     }
 
@@ -224,8 +247,8 @@ export class AuthService {
       email,
     };
 
-    if (doctorId) {
-      payload.doctorId = doctorId;
+    if (resolvedDoctorId) {
+      payload.doctorId = resolvedDoctorId;
     }
 
     const [accessToken, refreshToken] = await Promise.all([
@@ -255,6 +278,7 @@ export class AuthService {
     password: string;
     role: Role;
     doctorId?: string;
+    timezone?: string;
   }) {
     // Check if user already exists and is verified
     const existingUser = await this.usersService.findByEmail(data.email);
@@ -283,7 +307,7 @@ export class AuthService {
         name: data.name,
         password: hashedPassword,
         role: data.role,
-        doctorId: data.doctorId,
+        ...(data.timezone ? { timezone: data.timezone } : {}),
         emailVerificationOtp: hashedOtp,
         emailVerificationOtpExpires: expiresAt,
         isEmailVerified: false,
@@ -318,26 +342,7 @@ export class AuthService {
       throw new UnauthorizedException('User not found');
     }
 
-    await this.validateDoctorStatus(user);
-
-    // Generate tokens
-    const tokens = await this.generateToken(
-      user._id.toString(),
-      user.role,
-      user.email,
-      user.doctorId,
-    );
-    await this.usersService.updateRefreshToken(
-      user._id.toString(),
-      tokens.refreshToken,
-    );
-
-    return {
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      ...tokens,
-    };
+    return this.issueSession(user);
   }
 
   async sendPasswordResetOtp(email: string) {

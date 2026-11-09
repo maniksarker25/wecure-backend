@@ -280,21 +280,18 @@ export class AppointmentManagerService {
         throw new ForbiddenException();
       }
     } else if (role === 'DOCTOR') {
-      if (doctorId) {
-        if (appointment.doctorId.toString() !== doctorId) {
-          throw new ForbiddenException();
-        }
-      } else {
-        // For doctors, requesterId is userId, need to lookup doctor profile
-        const doctor = await this.doctorModel
-          .findOne({ userId: requesterId })
-          .lean();
-        if (
-          !doctor ||
-          appointment.doctorId.toString() !== doctor._id.toString()
-        ) {
-          throw new ForbiddenException();
-        }
+      const doctor = await this.doctorModel
+        .findOne({ userId: requesterId })
+        .select('_id')
+        .lean();
+      if (
+        !doctor ||
+        appointment.doctorId.toString() !== doctor._id.toString() ||
+        (doctorId &&
+          Types.ObjectId.isValid(doctorId) &&
+          doctorId !== doctor._id.toString())
+      ) {
+        throw new ForbiddenException();
       }
     } else {
       throw new ForbiddenException();
@@ -477,18 +474,17 @@ export class AppointmentManagerService {
 
     const isPatient = appointment.userId.toString() === requesterId;
 
-    let isDoctor = false;
-    if (doctorId) {
-      isDoctor = appointment.doctorId.toString() === doctorId;
-    } else {
-      // For doctors, requesterId is userId, need to lookup doctor profile
-      const doctor = await this.doctorModel
-        .findOne({ userId: requesterId })
-        .lean();
-      isDoctor = !!(
-        doctor && appointment.doctorId.toString() === doctor._id.toString()
-      );
-    }
+    const doctor = await this.doctorModel
+      .findOne({ userId: requesterId })
+      .select('_id')
+      .lean();
+    const isDoctor = !!(
+      doctor &&
+      appointment.doctorId.toString() === doctor._id.toString() &&
+      (!doctorId ||
+        !Types.ObjectId.isValid(doctorId) ||
+        doctorId === doctor._id.toString())
+    );
 
     if (!isPatient && !isDoctor) {
       throw new ForbiddenException();

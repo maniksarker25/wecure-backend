@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -328,15 +329,10 @@ export class AppointmentFinderService {
     const skip = (page - 1) * limit;
 
     const filter: any = {};
-    if (doctorId && Types.ObjectId.isValid(doctorId)) {
-      filter.doctorId = new Types.ObjectId(doctorId);
-    } else if (userId) {
-      const doctor = await this.doctorModel.findOne({ userId }).lean();
-      if (!doctor) throw new NotFoundException('Doctor profile not found');
-      filter.doctorId = doctor._id;
-    } else {
+    if (!userId) {
       throw new BadRequestException('UserId or DoctorId is required');
     }
+    filter.doctorId = await this.resolveOwnDoctorId(userId, doctorId);
 
     if (query.status) {
       filter.status = query.status;
@@ -585,15 +581,7 @@ export class AppointmentFinderService {
     userId: string,
     doctorId?: string,
   ) {
-    let targetDoctorId: Types.ObjectId;
-
-    if (doctorId && Types.ObjectId.isValid(doctorId)) {
-      targetDoctorId = new Types.ObjectId(doctorId);
-    } else {
-      const doctor = await this.doctorModel.findOne({ userId }).lean();
-      if (!doctor) throw new NotFoundException('Doctor profile not found');
-      targetDoctorId = doctor._id as Types.ObjectId;
-    }
+    const targetDoctorId = await this.resolveOwnDoctorId(userId, doctorId);
 
     const appointment = await this.appointmentModel
       .findOne({
@@ -819,5 +807,21 @@ export class AppointmentFinderService {
         };
       }),
     );
+  }
+
+  private async resolveOwnDoctorId(userId: string, claimedDoctorId?: string) {
+    const doctor = await this.doctorModel
+      .findOne({ userId })
+      .select('_id')
+      .lean();
+    if (!doctor) throw new NotFoundException('Doctor profile not found');
+    if (
+      claimedDoctorId &&
+      Types.ObjectId.isValid(claimedDoctorId) &&
+      claimedDoctorId !== doctor._id.toString()
+    ) {
+      throw new ForbiddenException();
+    }
+    return doctor._id as Types.ObjectId;
   }
 }

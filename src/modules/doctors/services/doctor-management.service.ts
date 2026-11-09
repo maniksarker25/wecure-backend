@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ForbiddenException,
   Inject,
   Injectable,
   NotFoundException,
@@ -30,6 +29,11 @@ import {
   DoctorService,
   DoctorServiceDocument,
 } from '../schemas/doctor-service.schema';
+import {
+  isDoctorProfileComplete,
+  resolveVerificationStatus,
+  statusAfterProfileSave,
+} from '../doctor-onboarding';
 import { Doctor, DoctorDocument } from '../schemas/doctor.schema';
 
 @Injectable()
@@ -60,20 +64,32 @@ export class DoctorManagementService {
   ) {}
   // ---------- Doctor Profile ----------
   async createProfile(userId: string, dto: any) {
-    const exists = await this.doctorModel.findOne({ userId });
-    if (exists) throw new ForbiddenException('Doctor profile already exists');
-
-    const { name, phone, ...doctorData } = dto;
+    const { name, phone, timezone, ...doctorData } = dto;
+    delete doctorData.doctorId;
     await this.validateSpecialty(doctorData.specialtyId);
 
-    if (name || phone) {
-      await this.usersService.updateProfile(userId, { name, phone });
+    if (name || phone || timezone) {
+      await this.usersService.updateProfile(userId, { name, phone, timezone });
     }
 
-    return this.doctorModel.create({
-      userId,
-      ...doctorData,
-    });
+    let doctor = await this.doctorModel.findOne({ userId });
+    if (!doctor) {
+      const created = {
+        userId,
+        ...doctorData,
+      };
+      this.applyOnboardingState(created, 'INCOMPLETE', false);
+      doctor = await this.doctorModel.create(created);
+    } else {
+      const currentStatus = doctor.verificationStatus;
+      const detailsChanged = this.verificationDetailsChanged(doctor, dto);
+      Object.assign(doctor, doctorData);
+      this.applyOnboardingState(doctor, currentStatus, detailsChanged);
+      await doctor.save();
+    }
+
+    await this.usersService.linkDoctorProfile(userId, doctor._id.toString());
+    return doctor;
   }
 
   async updateProfile(userId: string, dto: any, file?: Express.Multer.File) {
@@ -83,16 +99,26 @@ export class DoctorManagementService {
     const { name, phone, timezone, ...doctorData } = dto;
     await this.validateSpecialty(doctorData.specialtyId);
 
-    const verificationDetailsChanged =
-      (dto.mdcnRegistrationNumber !== undefined &&
-        dto.mdcnRegistrationNumber !== doctor.mdcnRegistrationNumber) ||
-      (dto.mdcnPracticingLicenseExpiryDate !== undefined &&
-        new Date(dto.mdcnPracticingLicenseExpiryDate).getTime() !==
-          doctor.mdcnPracticingLicenseExpiryDate?.getTime());
-    if (verificationDetailsChanged) {
-      doctorData.verificationStatus = 'PENDING';
-      doctorData.isVerified = false;
-    }
+    const merged = {
+      ...doctorData,
+      currentOrganization:
+        doctorData.currentOrganization ?? doctor.currentOrganization,
+      specialtyId: doctorData.specialtyId ?? doctor.specialtyId,
+      mdcnRegistrationNumber:
+        doctorData.mdcnRegistrationNumber ?? doctor.mdcnRegistrationNumber,
+      mdcnPracticingLicenseDocument: doctor.mdcnPracticingLicenseDocument,
+      mdcnPracticingLicenseExpiryDate:
+        doctorData.mdcnPracticingLicenseExpiryDate ??
+        doctor.mdcnPracticingLicenseExpiryDate,
+    };
+    this.applyOnboardingState(
+      merged,
+      doctor.verificationStatus,
+      this.verificationDetailsChanged(doctor, dto),
+    );
+    doctorData.isProfileComplete = merged.isProfileComplete;
+    doctorData.verificationStatus = merged.verificationStatus;
+    doctorData.isVerified = merged.isVerified;
 
     const userUpdate: any = {};
     if (name) {
@@ -122,6 +148,60 @@ export class DoctorManagementService {
       .populate('specialtyId', 'name');
   }
 
+  private applyOnboardingState(
+    target: any,
+    currentStatus: string | undefined,
+    detailsChanged: boolean,
+  ) {
+    const complete = isDoctorProfileComplete(target);
+    const status = statusAfterProfileSave(
+      currentStatus,
+      complete,
+      detailsChanged,
+    );
+    target.isProfileComplete = complete;
+    target.verificationStatus = status;
+    target.isVerified = status === 'VERIFIED';
+  }
+
+  private verificationDetailsChanged(doctor: any, dto: any) {
+    const expiryChanged =
+      dto.mdcnPracticingLicenseExpiryDate !== undefined &&
+      new Date(dto.mdcnPracticingLicenseExpiryDate).getTime() !==
+        new Date(doctor.mdcnPracticingLicenseExpiryDate || 0).getTime();
+    return (
+      (dto.mdcnRegistrationNumber !== undefined &&
+        dto.mdcnRegistrationNumber !== doctor.mdcnRegistrationNumber) ||
+      expiryChanged
+    );
+  }
+
+  private async persistOnboardingState(doctor: any) {
+    const complete = isDoctorProfileComplete(doctor);
+    const status = resolveVerificationStatus(
+      doctor.verificationStatus,
+      complete,
+    );
+    const verified = status === 'VERIFIED';
+    const changed =
+      doctor.isProfileComplete !== complete ||
+      doctor.verificationStatus !== status ||
+      !!doctor.isVerified !== verified;
+    doctor.isProfileComplete = complete;
+    doctor.verificationStatus = status;
+    doctor.isVerified = verified;
+    if (changed) {
+      await this.doctorModel.updateOne(
+        { _id: doctor._id },
+        {
+          isProfileComplete: complete,
+          verificationStatus: status,
+          isVerified: verified,
+        },
+      );
+    }
+  }
+
   private async validateSpecialty(specialtyId?: string) {
     if (!specialtyId) return;
 
@@ -138,6 +218,7 @@ export class DoctorManagementService {
       .populate('specialtyId', 'name')
       .lean();
     if (!doctor) return null;
+    await this.persistOnboardingState(doctor);
 
     // Decrypt phone number if it exists in populated userId
     if (doctor.userId && (doctor.userId as any).phone) {
@@ -270,7 +351,9 @@ export class DoctorManagementService {
   async getBankDetails(userId: string) {
     const doctor = await this.doctorModel
       .findOne({ userId })
-      .select('bankName bankCode accountName accountNumber paystackRecipientCode')
+      .select(
+        'bankName bankCode accountName accountNumber paystackRecipientCode',
+      )
       .lean();
     if (!doctor) throw new NotFoundException('Doctor profile not found');
 
@@ -447,8 +530,7 @@ export class DoctorManagementService {
     for (const upload of uploads) {
       doctor[upload.field] = upload.key;
     }
-    doctor.verificationStatus = 'PENDING';
-    doctor.isVerified = false;
+    this.applyOnboardingState(doctor, doctor.verificationStatus, true);
     await doctor.save();
     return doctor;
   }
@@ -466,7 +548,7 @@ export class DoctorManagementService {
     const previousStatus = doctor.verificationStatus;
     const user = doctor.userId as any;
 
-    if (status === 'VERIFIED') {
+    if (status === 'VERIFIED' && !isDoctorProfileComplete(doctor)) {
       if (!doctor.mdcnRegistrationNumber?.trim()) {
         throw new BadRequestException(
           'MDCN registration number is required to verify this doctor',
@@ -485,6 +567,9 @@ export class DoctorManagementService {
           'A current MDCN practising licence is required to verify this doctor',
         );
       }
+      throw new BadRequestException(
+        'Organization and specialty are required to verify this doctor',
+      );
     }
 
     const updateData: any = {
@@ -495,6 +580,7 @@ export class DoctorManagementService {
     // Update isVerified for backward compatibility
     if (status === 'VERIFIED') {
       updateData.isVerified = true;
+      updateData.isProfileComplete = true;
     } else {
       updateData.isVerified = false;
     }
