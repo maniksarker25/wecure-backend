@@ -52,6 +52,56 @@ export class NotificationsService {
     }
   }
 
+  async createInAppNotificationOnce(
+    userId: string | Types.ObjectId,
+    type: NotificationType,
+    title: string,
+    message: string,
+    data: Record<string, any>,
+    dedupeKey: string,
+  ) {
+    if (!userId || !Types.ObjectId.isValid(userId.toString())) {
+      this.logger.warn(
+        `Skipping notification with invalid userId: ${String(userId)}`,
+      );
+      return;
+    }
+
+    const userObjectId = new Types.ObjectId(userId);
+    try {
+      return await this.notificationModel.findOneAndUpdate(
+        { dedupeKey },
+        {
+          $setOnInsert: {
+            userId: userObjectId,
+            type,
+            title,
+            message,
+            data,
+            dedupeKey,
+          },
+        },
+        { upsert: true, new: true },
+      );
+    } catch (error) {
+      if (error?.code === 11000) {
+        try {
+          return await this.notificationModel.findOne({ dedupeKey });
+        } catch (lookupError) {
+          this.logger.error(
+            'Failed to retrieve existing deduplicated in-app notification',
+            lookupError,
+          );
+          return;
+        }
+      }
+      this.logger.error(
+        'Failed to create deduplicated in-app notification',
+        error,
+      );
+    }
+  }
+
   async getUserNotifications(userId: string, page = 1, limit = 20) {
     const userObjectId = this.toObjectId(userId, 'Invalid user ID');
     const safePage = this.normalizePositiveInteger(page, 1, 1, 100000);

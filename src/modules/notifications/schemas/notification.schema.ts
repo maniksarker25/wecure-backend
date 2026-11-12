@@ -21,6 +21,9 @@ export class Notification {
   @Prop({ type: Object })
   data: Record<string, any>;
 
+  @Prop({ select: false })
+  dedupeKey?: string;
+
   @Prop({ default: false })
   isRead: boolean;
 }
@@ -33,3 +36,4 @@ NotificationSchema.index({ isRead: 1 }); // Filter read/unread
 NotificationSchema.index({ type: 1 }); // Filter by notification type
 NotificationSchema.index({ userId: 1, isRead: 1, createdAt: -1 }); // Unread notifications query
 NotificationSchema.index({ userId: 1, createdAt: -1 }); // Notification feed chronologically
+NotificationSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });

@@ -16,6 +16,11 @@ import { Doctor, DoctorDocument } from '../../doctors/schemas/doctor.schema';
 import { PaystackService } from '../../payments/paystack.service';
 import { AuditLogsService } from '../../audit-logs/audit-logs.service';
 import { PayoutHelperService } from '../helpers/payout.helper';
+import { User, UserDocument } from '../../users/schemas/user.schema';
+import { Role } from '../../../common/enum/role.enum';
+import { UserStatus } from '../../../common/enum/user.status.enum';
+import { NotificationType } from '../../../common/enum/notification-type.enum';
+import { NotificationsService } from '../../notifications/notifications.service';
 
 @Injectable()
 export class PayoutManagerService {
@@ -26,10 +31,12 @@ export class PayoutManagerService {
     @InjectModel(Appointment.name)
     private appointmentModel: Model<AppointmentDocument>,
     @InjectModel(Doctor.name) private doctorModel: Model<DoctorDocument>,
+    @InjectModel(User.name) private userModel: Model<UserDocument>,
     private readonly paystackService: PaystackService,
     private readonly auditLogsService: AuditLogsService,
     private readonly payoutHelper: PayoutHelperService,
     private readonly configService: ConfigService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   /**
@@ -63,6 +70,7 @@ export class PayoutManagerService {
           this.logger.warn(
             `Skipping payout for doctor ${doctorId}: No valid bank details/recipient`,
           );
+          await this.notifyBankDetailsRequired(doctorId, batchId);
           continue;
         }
 
@@ -139,7 +147,8 @@ export class PayoutManagerService {
     }
 
     const reference =
-      existingPayout.paystackTransferId || this.buildTransferReference(payoutId);
+      existingPayout.paystackTransferId ||
+      this.buildTransferReference(payoutId);
 
     const payout = await this.payoutModel.findOneAndUpdate(
       {
@@ -173,11 +182,13 @@ export class PayoutManagerService {
       await payout.save();
       return payout;
     } catch (error) {
+      const previousRetryCount = payout.retryCount || 0;
       payout.status = PayoutStatus.FAILED;
       payout.failureReason = error.message;
-      payout.retryCount = (payout.retryCount || 0) + 1;
+      payout.retryCount = previousRetryCount + 1;
       await payout.save();
       this.logger.error(`Payout processing failed for ${payoutId}`, error);
+      await this.notifyTransferFailure(payout, previousRetryCount);
       return payout;
     }
   }
@@ -287,6 +298,156 @@ export class PayoutManagerService {
     }
   }
 
+  private async notifyBankDetailsRequired(
+    doctorId: Types.ObjectId,
+    batchId: string,
+  ) {
+    await this.notifyPayoutIssue({
+      doctorId,
+      type: NotificationType.PAYOUT_BANK_DETAILS_REQUIRED,
+      title: 'Update your payout bank details',
+      doctorMessage:
+        'We could not prepare your payout because your bank details are missing or could not be verified. Please update your bank details in the app or contact support. Your eligible earnings remain unpaid.',
+      adminMessage: `Payout batch ${batchId} was skipped because this doctor's bank details or Paystack recipient could not be verified.`,
+      data: { batchId, issue: 'BANK_DETAILS_OR_RECIPIENT_INVALID' },
+      dedupePrefix: `payout-bank-details:${doctorId}:${batchId}`,
+    });
+  }
+
+  private async notifyTransferFailure(
+    payout: PayoutDocument,
+    previousRetryCount: number,
+  ) {
+    const maxRetries = this.configService.get<number>('PAYOUT_MAX_RETRIES', 3);
+    const isFirstFailure = previousRetryCount === 0;
+    const retriesExhausted = payout.retryCount >= maxRetries;
+
+    if (!isFirstFailure && !retriesExhausted) return;
+
+    await this.notifyPayoutIssue({
+      doctorId: payout.doctorId,
+      type: NotificationType.PAYOUT_FAILED,
+      title: retriesExhausted
+        ? 'Payout needs attention'
+        : 'Payout transfer failed',
+      doctorMessage:
+        'We could not complete your payout transfer. Please verify your bank details in the app or contact support. The system will retry automatically when retries remain.',
+      adminMessage: retriesExhausted
+        ? `Payout ${payout._id} for batch ${payout.batchId} has exhausted its automatic retries and needs manual attention. Reason: ${payout.failureReason || 'Transfer failed'}.`
+        : `Payout ${payout._id} for batch ${payout.batchId} failed and will be retried automatically when retries remain. Reason: ${payout.failureReason || 'Transfer failed'}.`,
+      data: {
+        payoutId: payout._id.toString(),
+        batchId: payout.batchId,
+        retryCount: payout.retryCount,
+        retriesExhausted,
+      },
+      dedupePrefix: `payout-transfer-failure:${payout._id}:${retriesExhausted ? 'exhausted' : 'first'}`,
+      notifyDoctor: isFirstFailure,
+      notifyAdmins: isFirstFailure || retriesExhausted,
+    });
+  }
+
+  private async notifyPayoutIssue(options: {
+    doctorId: Types.ObjectId;
+    type: NotificationType;
+    title: string;
+    doctorMessage: string;
+    adminMessage: string;
+    data: Record<string, any>;
+    dedupePrefix: string;
+    notifyDoctor?: boolean;
+    notifyAdmins?: boolean;
+  }) {
+    const {
+      doctorId,
+      type,
+      title,
+      doctorMessage,
+      adminMessage,
+      data,
+      dedupePrefix,
+      notifyDoctor = true,
+      notifyAdmins = true,
+    } = options;
+    const recipients: Array<{ userId: Types.ObjectId; isDoctor: boolean }> = [];
+
+    if (notifyDoctor) {
+      try {
+        const doctor = await this.doctorModel
+          .findById(doctorId)
+          .select('userId')
+          .lean();
+        if (doctor?.userId) {
+          recipients.push({
+            userId: new Types.ObjectId(doctor.userId as Types.ObjectId),
+            isDoctor: true,
+          });
+        } else {
+          this.logger.warn(
+            `Cannot notify doctor ${doctorId}: linked user was not found`,
+          );
+        }
+      } catch (error) {
+        this.logger.error(
+          `Failed to resolve notification recipient for doctor ${doctorId}`,
+          error,
+        );
+      }
+    }
+
+    if (notifyAdmins) {
+      try {
+        const admins = await this.userModel
+          .find({
+            role: { $in: [Role.ADMIN, Role.SUPER_ADMIN] },
+            status: UserStatus.ACTIVE,
+          })
+          .select('_id')
+          .lean();
+        if (admins.length === 0) {
+          this.logger.warn(
+            'No active admin users found for payout notification',
+          );
+        }
+        recipients.push(
+          ...admins.map((admin) => ({
+            userId: new Types.ObjectId(admin._id),
+            isDoctor: false,
+          })),
+        );
+      } catch (error) {
+        this.logger.error(
+          'Failed to resolve payout admin notification recipients',
+          error,
+        );
+      }
+    }
+
+    try {
+      await Promise.all(
+        recipients.map(({ userId, isDoctor }) =>
+          this.notificationsService.createInAppNotificationOnce(
+            userId,
+            type,
+            title,
+            isDoctor ? doctorMessage : adminMessage,
+            {
+              ...data,
+              doctorId: doctorId.toString(),
+              audience: isDoctor ? 'DOCTOR' : 'ADMIN',
+            },
+            `${dedupePrefix}:${userId.toString()}`,
+          ),
+        ),
+      );
+    } catch (error) {
+      this.logger.error(
+        `Failed to persist payout notifications for doctor ${doctorId}`,
+        error,
+      );
+    }
+  }
+
   /**
    * Complete payout from Paystack Webhook
    */
@@ -385,9 +546,17 @@ export class PayoutManagerService {
       return;
     }
 
+    if (payout.status === PayoutStatus.FAILED) {
+      this.logger.log(
+        `Ignoring duplicate transfer failure for payout ${payout._id}`,
+      );
+      return;
+    }
+
+    const previousRetryCount = payout.retryCount || 0;
     payout.status = PayoutStatus.FAILED;
     payout.failureReason = reason || 'Transfer failed';
-    payout.retryCount = (payout.retryCount || 0) + 1;
+    payout.retryCount = previousRetryCount + 1;
     payout.metadata = {
       ...(payout.metadata || {}),
       failureWebhook: metadata,
@@ -405,6 +574,7 @@ export class PayoutManagerService {
         batchId: payout.batchId,
       },
     });
+    await this.notifyTransferFailure(payout, previousRetryCount);
   }
 
   private buildTransferReference(payoutId: string) {

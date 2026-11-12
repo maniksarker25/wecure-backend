@@ -203,6 +203,12 @@ async function createIndexes() {
     },
     // Fallback: all notifications for a user ordered by date
     { key: { userId: 1, createdAt: -1 }, name: 'idx_notif_user_date' },
+    {
+      key: { dedupeKey: 1 },
+      name: 'idx_notif_dedupe_key_unique',
+      unique: true,
+      sparse: true,
+    },
   ]);
   console.log('  ✅ notifications indexes created\n');
 

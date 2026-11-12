@@ -8,10 +8,12 @@ describe('PayoutManagerService', () => {
   let payoutModel: any;
   let appointmentModel: any;
   let doctorModel: any;
+  let userModel: any;
   let paystackService: any;
   let auditLogsService: any;
   let payoutHelper: any;
   let configService: any;
+  let notificationsService: any;
 
   const payoutId = new Types.ObjectId();
   const doctorId = new Types.ObjectId();
@@ -36,6 +38,12 @@ describe('PayoutManagerService', () => {
       findById: jest.fn(),
       findByIdAndUpdate: jest.fn(),
     };
+    userModel = {
+      find: jest.fn().mockReturnValue({
+        select: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockResolvedValue([]),
+      }),
+    };
     paystackService = {
       initiateTransfer: jest.fn(),
       listBanks: jest.fn(),
@@ -54,15 +62,20 @@ describe('PayoutManagerService', () => {
     configService = {
       get: jest.fn((_key: string, fallback?: any) => fallback),
     };
+    notificationsService = {
+      createInAppNotificationOnce: jest.fn().mockResolvedValue(undefined),
+    };
 
     service = new PayoutManagerService(
       payoutModel,
       appointmentModel,
       doctorModel,
+      userModel,
       paystackService,
       auditLogsService,
       payoutHelper,
       configService as ConfigService,
+      notificationsService,
     );
   });
 
@@ -107,6 +120,47 @@ describe('PayoutManagerService', () => {
     );
   });
 
+  it('notifies the doctor and admins when bank details prevent payout setup', async () => {
+    const appointmentId = new Types.ObjectId();
+    const doctorUserId = new Types.ObjectId();
+    appointmentModel.aggregate.mockResolvedValue([
+      {
+        _id: doctorId,
+        appointmentIds: [appointmentId],
+        totalEarnings: 1000,
+      },
+    ]);
+    jest.spyOn(service, 'ensureTransferRecipient').mockResolvedValue(null);
+    doctorModel.findById.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      lean: jest.fn().mockResolvedValue({ userId: doctorUserId }),
+    });
+    userModel.find.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      lean: jest.fn().mockResolvedValue([{ _id: new Types.ObjectId() }]),
+    });
+
+    await service.createPayoutBatch('2026-W28');
+
+    expect(
+      notificationsService.createInAppNotificationOnce,
+    ).toHaveBeenCalledTimes(2);
+    expect(
+      notificationsService.createInAppNotificationOnce,
+    ).toHaveBeenCalledWith(
+      doctorUserId,
+      'PAYOUT_BANK_DETAILS_REQUIRED',
+      'Update your payout bank details',
+      expect.stringContaining('bank details are missing'),
+      expect.objectContaining({
+        batchId: '2026-W28',
+        audience: 'DOCTOR',
+      }),
+      `payout-bank-details:${doctorId}:2026-W28:${doctorUserId}`,
+    );
+    expect(appointmentModel.updateMany).not.toHaveBeenCalled();
+  });
+
   it('initiates transfers with a stable payout reference', async () => {
     const payout: any = {
       _id: payoutId,
@@ -144,6 +198,41 @@ describe('PayoutManagerService', () => {
       `payout_${payoutId}`,
     );
     expect(payout.save).toHaveBeenCalled();
+  });
+
+  it('notifies both parties when Paystack rejects the transfer request', async () => {
+    const doctorUserId = new Types.ObjectId();
+    const payout: any = {
+      _id: payoutId,
+      doctorId,
+      batchId: '2026-07',
+      payoutAmount: 900,
+      transferRecipientCode: 'RCP_test',
+      status: PayoutStatus.PENDING,
+      retryCount: 0,
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    payoutModel.findById.mockResolvedValue(payout);
+    payoutModel.findOneAndUpdate.mockResolvedValue(payout);
+    paystackService.initiateTransfer.mockRejectedValue(
+      new Error('Bank transfer rejected'),
+    );
+    doctorModel.findById.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      lean: jest.fn().mockResolvedValue({ userId: doctorUserId }),
+    });
+    userModel.find.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      lean: jest.fn().mockResolvedValue([{ _id: new Types.ObjectId() }]),
+    });
+
+    const result = await service.processPayout(payoutId.toString());
+
+    expect(result.status).toBe(PayoutStatus.FAILED);
+    expect(result.retryCount).toBe(1);
+    expect(
+      notificationsService.createInAppNotificationOnce,
+    ).toHaveBeenCalledTimes(2);
   });
 
   it('processes due payouts in scheduled batches', async () => {
@@ -233,6 +322,7 @@ describe('PayoutManagerService', () => {
   });
 
   it('records failed transfer webhooks for retry', async () => {
+    const doctorUserId = new Types.ObjectId();
     const payout: any = {
       _id: payoutId,
       doctorId,
@@ -245,6 +335,14 @@ describe('PayoutManagerService', () => {
 
     payoutModel.findOne.mockResolvedValue(payout);
     auditLogsService.create.mockResolvedValue({});
+    doctorModel.findById.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      lean: jest.fn().mockResolvedValue({ userId: doctorUserId }),
+    });
+    userModel.find.mockReturnValue({
+      select: jest.fn().mockReturnThis(),
+      lean: jest.fn().mockResolvedValue([{ _id: new Types.ObjectId() }]),
+    });
 
     await service.failPayoutFromWebhook(`payout_${payoutId}`, 'Bank offline', {
       reference: `payout_${payoutId}`,
@@ -261,5 +359,16 @@ describe('PayoutManagerService', () => {
         resourceId: payoutId.toString(),
       }),
     );
+    expect(
+      notificationsService.createInAppNotificationOnce,
+    ).toHaveBeenCalledTimes(2);
+
+    await service.failPayoutFromWebhook(`payout_${payoutId}`, 'Bank offline', {
+      reference: `payout_${payoutId}`,
+    });
+    expect(payout.retryCount).toBe(1);
+    expect(
+      notificationsService.createInAppNotificationOnce,
+    ).toHaveBeenCalledTimes(2);
   });
 });

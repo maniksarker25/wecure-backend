@@ -16,6 +16,7 @@ import { AuditLogsModule } from '../audit-logs/audit-logs.module';
 import { ConfigModule } from '@nestjs/config';
 import { HttpModule } from '@nestjs/axios';
 import { EncryptionService } from '../../common/services/encryption.service';
+import { User, UserSchema } from '../users/schemas/user.schema';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { EncryptionService } from '../../common/services/encryption.service';
       { name: Payout.name, schema: PayoutSchema },
       { name: Appointment.name, schema: AppointmentSchema },
       { name: Doctor.name, schema: DoctorSchema },
+      { name: User.name, schema: UserSchema },
     ]),
     HttpModule,
     AuditLogsModule,
