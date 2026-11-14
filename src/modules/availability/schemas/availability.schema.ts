@@ -9,28 +9,28 @@ export type AvailabilityDocument = DoctorAvailability & Document;
 })
 export class DoctorAvailability {
   @Prop({ type: Types.ObjectId, ref: 'Doctor', required: true, index: true })
-  doctorId: Types.ObjectId;
+  doctorId!: Types.ObjectId;
 
   @Prop({
     required: true,
     enum: DayOfWeek,
   })
-  dayOfWeek: DayOfWeek;
+  dayOfWeek!: DayOfWeek;
 
   @Prop({ required: true, min: 5 })
-  slotSizeMinutes: number;
+  slotSizeMinutes!: number;
 
   @Prop({ required: true })
-  startTime: string; // HH:mm
+  startTime!: string; // HH:mm
 
   @Prop({ required: true })
-  endTime: string; // HH:mm
+  endTime!: string; // HH:mm
 
   @Prop({ default: true })
-  isActive: boolean;
+  isActive!: boolean;
 
   @Prop({ required: true, default: 0, min: 50 }) // Paystack minimum refund amount is 50 NGN
-  fee: number;
+  fee!: number;
 }
 
 export const DoctorAvailabilitySchema =

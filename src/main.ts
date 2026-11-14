@@ -102,8 +102,6 @@ async function bootstrap() {
   const allowlist = [
     'http://localhost:3000',
     'http://localhost:3030',
-    'http://localhost:3001',
-    'http://localhost:5173',
     'http://localhost:5174',
     'https://app.wecurehealth.com',
     'https://wecurehealth.com',
