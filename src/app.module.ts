@@ -15,6 +15,7 @@ import { appConfig } from './config/app.config';
 import { cacheConfig } from './config/cache.config';
 import { databaseConfig } from './config/database.config';
 import { throttlerConfig } from './config/throttler.config';
+import { validateEnv } from './config/env.validation';
 import { AuditLogsModule } from './modules/audit-logs/audit-logs.module';
 import { AuditLogsService } from './modules/audit-logs/audit-logs.service';
 import { DomainModule } from './modules/domain.module';
@@ -30,6 +31,7 @@ const cacheLogger = new Logger('Cache');
     ConfigModule.forRoot({
       isGlobal: true,
       load: [databaseConfig, awsConfig, appConfig],
+      validate: validateEnv,
     }),
     MongooseModule.forRootAsync({
       imports: [ConfigModule],

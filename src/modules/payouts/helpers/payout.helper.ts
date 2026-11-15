@@ -62,6 +62,19 @@ export class PayoutHelperService {
     return [
       { $match: match },
       {
+        // Exclude appointments whose payment has since been refunded (or whose
+        // payment record is missing) so doctors are never paid out for
+        // consultations the platform has already returned money on.
+        $lookup: {
+          from: 'payments',
+          localField: 'paymentId',
+          foreignField: '_id',
+          as: 'payment',
+        },
+      },
+      { $unwind: '$payment' },
+      { $match: { 'payment.isRefunded': { $ne: true } } },
+      {
         $group: {
           _id: '$doctorId',
           totalEarnings: { $sum: '$consultationFee' },

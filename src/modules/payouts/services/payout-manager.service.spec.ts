@@ -91,6 +91,10 @@ describe('PayoutManagerService', () => {
       },
     ]);
     appointmentModel.updateMany.mockResolvedValue({ modifiedCount: 1 });
+    doctorModel.findById.mockResolvedValue({
+      _id: doctorId,
+      pendingClawbackAmount: 0,
+    });
     jest
       .spyOn(service, 'ensureTransferRecipient')
       .mockResolvedValue('RCP_test');
@@ -116,6 +120,88 @@ describe('PayoutManagerService', () => {
         payoutAmount: 900,
         transferRecipientCode: 'RCP_test',
         status: PayoutStatus.PENDING,
+      }),
+    );
+  });
+
+  it('nets a pending clawback off the doctor payout amount', async () => {
+    const appointmentId = new Types.ObjectId();
+
+    appointmentModel.aggregate.mockResolvedValue([
+      {
+        _id: doctorId,
+        appointmentIds: [appointmentId],
+        totalEarnings: 1000,
+        count: 1,
+      },
+    ]);
+    appointmentModel.updateMany.mockResolvedValue({ modifiedCount: 1 });
+    doctorModel.findById.mockResolvedValue({
+      _id: doctorId,
+      pendingClawbackAmount: 300,
+    });
+    doctorModel.findByIdAndUpdate.mockResolvedValue({});
+    jest
+      .spyOn(service, 'ensureTransferRecipient')
+      .mockResolvedValue('RCP_test');
+
+    const payouts = await service.createPayoutBatch('2026-07');
+
+    expect(payouts).toHaveLength(1);
+    expect(payoutModel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payoutAmount: 600,
+        clawbackApplied: 300,
+        status: PayoutStatus.PENDING,
+      }),
+    );
+    expect(doctorModel.findByIdAndUpdate).toHaveBeenCalledWith(doctorId, {
+      $inc: { pendingClawbackAmount: -300 },
+    });
+  });
+
+  it('settles appointments without a transfer when clawback fully absorbs the payout', async () => {
+    const appointmentId = new Types.ObjectId();
+
+    appointmentModel.aggregate.mockResolvedValue([
+      {
+        _id: doctorId,
+        appointmentIds: [appointmentId],
+        totalEarnings: 1000,
+        count: 1,
+      },
+    ]);
+    appointmentModel.updateMany.mockResolvedValue({ modifiedCount: 1 });
+    doctorModel.findById.mockResolvedValue({
+      _id: doctorId,
+      pendingClawbackAmount: 5000,
+    });
+    doctorModel.findByIdAndUpdate.mockResolvedValue({});
+    auditLogsService.create.mockResolvedValue({});
+    const ensureRecipientSpy = jest.spyOn(service, 'ensureTransferRecipient');
+
+    const payouts = await service.createPayoutBatch('2026-07');
+
+    expect(payouts).toHaveLength(1);
+    expect(ensureRecipientSpy).not.toHaveBeenCalled();
+    expect(payoutModel).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payoutAmount: 0,
+        clawbackApplied: 900,
+        status: PayoutStatus.COMPLETED,
+      }),
+    );
+    expect(doctorModel.findByIdAndUpdate).toHaveBeenCalledWith(doctorId, {
+      $inc: { pendingClawbackAmount: -900 },
+    });
+    expect(appointmentModel.updateMany).toHaveBeenCalledWith(
+      { _id: { $in: [appointmentId] } },
+      { isPaidOut: true, paidOutAt: expect.any(Date), payoutAmount: 0 },
+    );
+    expect(auditLogsService.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'PAYOUT_COMPLETED',
+        metadata: expect.objectContaining({ clawbackApplied: 900 }),
       }),
     );
   });

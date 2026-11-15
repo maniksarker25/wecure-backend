@@ -14,6 +14,7 @@ import { HttpModule } from '@nestjs/axios';
 import { AuditLogsModule } from '../audit-logs/audit-logs.module';
 import { ConfigModule } from '@nestjs/config';
 import { AppointmentsModule } from '../appointments/appointments.module';
+import { Doctor, DoctorSchema } from '../doctors/schemas/doctor.schema';
 
 @Module({
   imports: [
@@ -21,6 +22,7 @@ import { AppointmentsModule } from '../appointments/appointments.module';
       { name: Refund.name, schema: RefundSchema },
       { name: Payment.name, schema: PaymentSchema },
       { name: Appointment.name, schema: AppointmentSchema },
+      { name: Doctor.name, schema: DoctorSchema },
     ]),
     HttpModule,
     AuditLogsModule,

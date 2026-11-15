@@ -58,20 +58,41 @@ export class PayoutManagerService {
       let appointmentIds: Types.ObjectId[] = [];
 
       try {
-        const { platformCommission, payoutAmount } =
+        const doctor = await this.doctorModel.findById(doctorId);
+        if (!doctor) {
+          this.logger.warn(`Skipping payout: doctor ${doctorId} not found`);
+          continue;
+        }
+
+        const { platformCommission, payoutAmount: grossPayoutAmount } =
           this.payoutHelper.calculatePayoutAmount(result.totalEarnings);
 
-        // Ensure Recipient
-        const recipientCode = await this.ensureTransferRecipient(
-          doctorId.toString(),
+        // Net off any amount already paid to this doctor for appointments
+        // that were later refunded (see RefundsService.recordPayoutClawback).
+        const clawbackApplied = Number(
+          Math.min(
+            doctor.pendingClawbackAmount || 0,
+            grossPayoutAmount,
+          ).toFixed(2),
+        );
+        const payoutAmount = Number(
+          (grossPayoutAmount - clawbackApplied).toFixed(2),
         );
 
-        if (!recipientCode) {
-          this.logger.warn(
-            `Skipping payout for doctor ${doctorId}: No valid bank details/recipient`,
+        let recipientCode: string | null = null;
+        if (payoutAmount > 0) {
+          // Ensure Recipient (only needed when there's actually money to move)
+          recipientCode = await this.ensureTransferRecipient(
+            doctorId.toString(),
           );
-          await this.notifyBankDetailsRequired(doctorId, batchId);
-          continue;
+
+          if (!recipientCode) {
+            this.logger.warn(
+              `Skipping payout for doctor ${doctorId}: No valid bank details/recipient`,
+            );
+            await this.notifyBankDetailsRequired(doctorId, batchId);
+            continue;
+          }
         }
 
         payoutId = new Types.ObjectId();
@@ -97,6 +118,8 @@ export class PayoutManagerService {
           continue;
         }
 
+        const fullyAbsorbedByClawback = payoutAmount === 0 && clawbackApplied > 0;
+
         const payout = new this.payoutModel({
           _id: payoutId,
           doctorId: doctorId,
@@ -105,13 +128,45 @@ export class PayoutManagerService {
           totalEarnings: result.totalEarnings,
           platformCommission,
           payoutAmount,
-          transferRecipientCode: recipientCode,
-          status: PayoutStatus.PENDING,
+          clawbackApplied,
+          ...(recipientCode ? { transferRecipientCode: recipientCode } : {}),
+          status: fullyAbsorbedByClawback
+            ? PayoutStatus.COMPLETED
+            : PayoutStatus.PENDING,
           scheduledFor: new Date(),
+          ...(fullyAbsorbedByClawback ? { processedAt: new Date() } : {}),
         });
 
         await payout.save();
         payouts.push(payout);
+
+        if (clawbackApplied > 0) {
+          await this.doctorModel.findByIdAndUpdate(doctorId, {
+            $inc: { pendingClawbackAmount: -clawbackApplied },
+          });
+        }
+
+        if (fullyAbsorbedByClawback) {
+          // No real transfer to make — the appointments are already locked
+          // above, so just mark them settled with nothing owed.
+          await this.appointmentModel.updateMany(
+            { _id: { $in: appointmentIds } },
+            { isPaidOut: true, paidOutAt: new Date(), payoutAmount: 0 },
+          );
+
+          await this.auditLogsService.create({
+            userId: doctorId.toString(),
+            action: 'PAYOUT_COMPLETED',
+            resource: 'Payout',
+            resourceId: payout._id.toString(),
+            metadata: {
+              amount: 0,
+              clawbackApplied,
+              batchId,
+              note: 'Fully absorbed by prior payout clawback; no transfer made',
+            },
+          });
+        }
       } catch (error) {
         if (payoutId && appointmentIds.length > 0) {
           await this.appointmentModel.updateMany(

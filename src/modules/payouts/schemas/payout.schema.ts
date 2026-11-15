@@ -28,7 +28,10 @@ export class Payout {
   platformCommission: number; // 10% commission
 
   @Prop({ required: true })
-  payoutAmount: number; // 90% to doctor
+  payoutAmount: number; // 90% to doctor, net of any clawback applied below
+
+  @Prop({ default: 0 })
+  clawbackApplied: number = 0; // Deducted from this batch for prior over-payouts on refunded appointments
 
   @Prop()
   transferRecipientCode: string; // Paystack recipient code

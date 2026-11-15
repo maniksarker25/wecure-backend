@@ -144,145 +144,6 @@ export class PaymentsController {
     };
   }
 
-  // @Post('webhook/paystack')
-  // @HttpCode(HttpStatus.OK)
-  // async handleWebhook(
-  //   @Headers('x-paystack-signature') signature: string,
-  //   @Body() body: any,
-  //   @Req() req: any,
-  // ) {
-  //   this.logger.log('Incoming Paystack Webhook');
-  //   this.logger.debug(`Signature: ${signature}`);
-
-  //   const webhookSecret =
-  //     this.configService.get<string>('PAYSTACK_WEBHOOK_SECRET') ||
-  //     this.configService.get<string>('PAYSTACK_SECRET_KEY') ||
-  //     '';
-
-  //   if (!webhookSecret) {
-  //     this.logger.error('PAYSTACK_WEBHOOK_SECRET is not configured');
-  //     throw new ForbiddenException('Webhook secret not configured');
-  //   }
-
-  //   const raw =
-  //     req && req.body && Buffer.isBuffer(req.body)
-  //       ? req.body
-  //       : (req && req.rawBody) || JSON.stringify(body);
-
-  //   const computedHash = crypto
-  //     .createHmac('sha512', webhookSecret)
-  //     .update(raw)
-  //     .digest('hex');
-
-  //   try {
-  //     const sigBuf = Buffer.from(signature, 'hex');
-  //     const compBuf = Buffer.from(computedHash, 'hex');
-  //     if (
-  //       sigBuf.length !== compBuf.length ||
-  //       !crypto.timingSafeEqual(sigBuf, compBuf)
-  //     ) {
-  //       this.logger.error(
-  //         'Invalid Paystack webhook signature (timing-safe check failed)',
-  //       );
-  //       throw new ForbiddenException('Invalid signature');
-  //     }
-  //   } catch (e) {
-  //     if (computedHash !== signature) {
-  //       this.logger.error('Invalid Paystack signature');
-  //       this.logger.error(`Calculated Hash: ${computedHash}`);
-  //       this.logger.error(`Expected Signature: ${signature}`);
-  //       throw new ForbiddenException('Invalid signature');
-  //     }
-  //   }
-
-  //   this.logger.log(`Handling Paystack event: ${body.event}`);
-  //   console.log('Webhook payload:', body.en); // Consider removing or reducing in production
-
-  //   if (body.event === 'charge.success') {
-  //     const { reference, metadata } = body.data;
-  //     this.logger.log(`Processing charge.success for reference: ${reference}`);
-
-  //     let verified: any = null;
-  //     try {
-  //       verified = await this.paystackService.verifyTransaction(reference);
-  //     } catch (err: any) {
-  //       this.logger.error(
-  //         `Paystack verifyTransaction failed for ${reference}: ${err.message}`,
-  //       );
-  //     }
-
-  //     // Ensure verified status is success before proceeding
-  //     if (!verified || verified.status !== 'success') {
-  //       this.logger.error(
-  //         `Paystack verification failed or returned non-success for ${reference}`,
-  //       );
-  //       return { status: 'ignored' };
-  //     }
-
-  //     // Idempotency check handled by checking current status
-
-  //     // metadata logged via structured audit logs where needed
-
-  //     if (metadata?.type === 'APPOINTMENT') {
-  //       const payment = await this.paymentsService.findByReference(reference);
-  //       if (payment && payment.status !== 'PAID') {
-  //         // Update Payment
-  //         await this.paymentsService.updateStatus(reference, 'PAID');
-
-  //         // Update Appointment
-  //         if (metadata.appointmentId) {
-  //           // We need payment._id to link to appointment
-  //           // payment object from findByReference has _id
-  //           await this.appointmentManagerService.markAsPaid(
-  //             metadata.appointmentId,
-  //             payment._id.toString(),
-  //           );
-  //         }
-
-  //         // Log Audit
-  //         await this.auditLogsService.create({
-  //           userId: metadata.userId,
-  //           action: 'PAYMENT_SUCCESS',
-  //           resource: 'Appointment',
-  //           resourceId: metadata.appointmentId,
-  //           ipAddress: body.data.ip_address,
-  //         });
-  //       }
-  //     } else if (metadata?.type === 'DONATION') {
-  //       const donation = await this.donationsService.findByReference(reference);
-  //       if (donation && donation.status !== 'PAID') {
-  //         // Update Donation
-  //         donation.status = 'PAID';
-  //         await donation.save();
-
-  //         // Log Audit
-  //         await this.auditLogsService.create({
-  //           userId: metadata.userId || 'ANONYMOUS',
-  //           action: 'DONATION_SUCCESS',
-  //           resource: 'Donation',
-  //           resourceId: donation._id.toString(),
-  //           ipAddress: body.data.ip_address,
-  //         });
-  //       }
-  //     }
-  //   } else if (body.event === 'transfer.success') {
-  //     const { reference } = body.data; // paystackTransferId
-  //     await this.payoutManagerService.completePayoutFromWebhook(reference);
-  //   } else if (body.event === 'transfer.failed') {
-  //     // Handle transfer failure? PayoutsService didn't implement explicit failure handler but we can log
-  //     this.logger.error(
-  //       `Transfer failed for reference ${body.data.reference}: ${body.data.reason}`,
-  //     );
-  //     // Ideally update payout status to FAILED.
-  //     // I should expose a method in PayoutsService for this. for now just log.
-  //   } else if (body.event === 'refund.processed') {
-  //     // Refund successful
-  //     await this.refundsService.handleRefundWebhook(body.data);
-  //   }
-
-  //   return { status: 'success' };
-  // }
-
   @Post('webhook/paystack')
   @HttpCode(HttpStatus.OK)
   async handleWebhook(
@@ -320,10 +181,14 @@ export class PaymentsController {
       .update(rawBody)
       .digest('hex');
 
-    if (computedHash !== signature) {
+    const computedBuf = Buffer.from(computedHash, 'hex');
+    const signatureBuf = Buffer.from(signature || '', 'hex');
+    const signatureMatches =
+      computedBuf.length === signatureBuf.length &&
+      crypto.timingSafeEqual(computedBuf, signatureBuf);
+
+    if (!signatureMatches) {
       this.logger.error('Invalid Paystack signature');
-      this.logger.debug(`Expected: ${computedHash}`);
-      this.logger.debug(`Received: ${signature}`);
       throw new ForbiddenException('Invalid signature');
     }
 

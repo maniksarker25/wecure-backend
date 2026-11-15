@@ -10,6 +10,7 @@ import { Types } from 'mongoose';
 import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
 import { NotificationsService } from '../notifications/notifications.service';
 import { Appointment } from '../appointments/schemas/appointment.schema';
+import { Doctor } from '../doctors/schemas/doctor.schema';
 
 describe('RefundsService', () => {
   let service: RefundsService;
@@ -73,6 +74,10 @@ describe('RefundsService', () => {
         {
           provide: getModelToken(Appointment.name),
           useValue: { findById: jest.fn() },
+        },
+        {
+          provide: getModelToken(Doctor.name),
+          useValue: { findByIdAndUpdate: jest.fn() },
         },
       ],
     }).compile();

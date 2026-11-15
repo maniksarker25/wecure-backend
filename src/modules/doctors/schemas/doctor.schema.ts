@@ -85,6 +85,11 @@ export class Doctor {
 
   @Prop({ default: 0 })
   pendingPayouts: number; // Awaiting payout
+
+  // Amount already paid out to this doctor for appointments that were later
+  // refunded; deducted from the doctor's next payout batch(es) until cleared.
+  @Prop({ default: 0 })
+  pendingClawbackAmount: number = 0;
 }
 
 export const DoctorSchema = SchemaFactory.createForClass(Doctor);

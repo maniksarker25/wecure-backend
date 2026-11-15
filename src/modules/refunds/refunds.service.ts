@@ -25,7 +25,11 @@ import {
 } from '../appointments/schemas/appointment.schema';
 import { AppointmentStatus } from 'src/common/enum/appointment-status.enum';
 import { NotificationsService } from '../notifications/notifications.service';
-import { combineDateAndTime } from 'src/common/utils/business-time.util';
+import { Doctor, DoctorDocument } from '../doctors/schemas/doctor.schema';
+import {
+  combineDateAndTime,
+  DEFAULT_BUSINESS_TIMEZONE,
+} from 'src/common/utils/business-time.util';
 
 @Injectable()
 export class RefundsService {
@@ -40,6 +44,8 @@ export class RefundsService {
     private readonly notificationsService: NotificationsService,
     @InjectModel(Appointment.name)
     private readonly appointmentModel: Model<AppointmentDocument>,
+    @InjectModel(Doctor.name)
+    private readonly doctorModel: Model<DoctorDocument>,
   ) {}
 
   /**
@@ -72,6 +78,14 @@ export class RefundsService {
       throw new BadRequestException('Payment already refunded');
     }
 
+    // This appointment was already paid out to the doctor (e.g. an admin
+    // refunding a completed, settled session). The patient still gets their
+    // money back, but the amount must be clawed back from the doctor's next
+    // payout(s) instead of silently becoming a platform loss.
+    if (appointment.isPaidOut) {
+      await this.recordPayoutClawback(appointment, appointmentId, initiatedBy);
+    }
+
     const dto = new CreateRefundDto();
     dto.paymentId = payment._id.toString();
     dto.appointmentId = appointmentId; // Keeping as string, manual conversion handled if needed or rely on validation
@@ -84,6 +98,52 @@ export class RefundsService {
     dto.initiatedBy = initiatedBy;
 
     return this.initiateRefund(dto, payment.paystackReference);
+  }
+
+  /**
+   * Queue a deduction against the doctor's next payout batch(es) for an
+   * amount they were already paid, and leave an auditable record of why.
+   */
+  private async recordPayoutClawback(
+    appointment: Appointment,
+    appointmentId: string,
+    initiatedBy: string,
+  ): Promise<void> {
+    const clawbackAmount =
+      appointment.payoutAmount && appointment.payoutAmount > 0
+        ? appointment.payoutAmount
+        : this.estimateDoctorPayoutShare(appointment.consultationFee);
+
+    if (clawbackAmount <= 0) return;
+
+    await this.doctorModel.findByIdAndUpdate(appointment.doctorId, {
+      $inc: { pendingClawbackAmount: clawbackAmount },
+    });
+
+    await this.auditLogsService.create({
+      userId: initiatedBy,
+      action: 'PAYOUT_CLAWBACK_RECORDED',
+      resource: 'Payout',
+      resourceId: appointmentId,
+      metadata: {
+        doctorId: appointment.doctorId.toString(),
+        appointmentId,
+        clawbackAmount,
+        reason:
+          'Refund issued for an appointment already paid out to the doctor; amount queued for deduction from their next payout batch.',
+      } as any,
+    });
+
+    this.logger.warn(
+      `Appointment ${appointmentId} refunded after payout — queued ${clawbackAmount} clawback against doctor ${appointment.doctorId}`,
+    );
+  }
+
+  private estimateDoctorPayoutShare(amount: number): number {
+    const commissionPercent = parseInt(
+      this.configService.get<string>('PLATFORM_COMMISSION_PERCENT') || '10',
+    );
+    return Number((amount - (amount * commissionPercent) / 100).toFixed(2));
   }
 
   /**
@@ -194,10 +254,12 @@ export class RefundsService {
     appointment: Appointment,
     cancellationTime: Date,
   ): number {
-    // Determine appointment start time (in the business timezone, not the host's)
+    // Determine appointment start time in the doctor's own timezone (falls
+    // back to the default business timezone if one wasn't recorded).
     const appointmentStart = combineDateAndTime(
       appointment.appointmentDate,
       appointment.appointmentTime,
+      appointment.doctorTimezone || DEFAULT_BUSINESS_TIMEZONE,
     );
 
     // Policy:
@@ -225,7 +287,27 @@ export class RefundsService {
     dto: CreateRefundDto,
     paystackReference: string,
   ): Promise<Refund> {
-    // 1. Create Refund Record (Pending)
+    // 1. Atomically claim the payment before doing anything else. This closes
+    // the check-then-act race: two concurrent refund attempts on the same
+    // payment can no longer both pass an `isRefunded` read and both call
+    // Paystack — only one `findOneAndUpdate` can match `isRefunded: false`.
+    const claimedPayment = await this.paymentModel.findOneAndUpdate(
+      { _id: new Types.ObjectId(dto.paymentId), isRefunded: false },
+      {
+        isRefunded: true,
+        refundedAmount: dto.amount,
+        refundedAt: new Date(),
+      },
+      { new: true },
+    );
+
+    if (!claimedPayment) {
+      throw new BadRequestException(
+        'Payment already refunded or a refund is already in progress',
+      );
+    }
+
+    // 2. Create Refund Record (Pending)
     const refund = new this.refundModel({
       ...dto,
       paymentId: new Types.ObjectId(dto.paymentId),
@@ -239,7 +321,7 @@ export class RefundsService {
     await refund.save();
 
     try {
-      // 2. Call Paystack Refund API
+      // 3. Call Paystack Refund API
       // Note: Amount passed to Paystack likely needs to be in kobo if consistent with other Paystack APIs?
       // Checking paystack.service logic: yes, initiateRefund converts to kobo * 100 inside the service.
       const paystackResponse = await this.paystackService.initiateRefund(
@@ -248,7 +330,7 @@ export class RefundsService {
         dto.reason,
       );
 
-      // 3. Update Refund Record
+      // 4. Update Refund Record
       refund.paystackRefundId = String(
         paystackResponse.id || paystackResponse.reference,
       ); // Use whatever ID Paystack returns, often 'id' for refund object
@@ -258,16 +340,14 @@ export class RefundsService {
       refund.metadata = paystackResponse;
       await refund.save();
 
-      // 4. Update Payment Record
+      // 5. Finish updating the Payment Record (isRefunded/refundedAmount/refundedAt
+      // were already claimed atomically in step 1)
       await this.paymentModel.findByIdAndUpdate(dto.paymentId, {
-        isRefunded: true,
         refundId: refund._id,
-        refundedAmount: dto.amount,
-        refundedAt: new Date(),
         status: 'PAID',
       });
 
-      // 5. Create Audit Log
+      // 6. Create Audit Log
       await this.auditLogsService.create({
         userId: dto.initiatedBy,
         action: 'REFUND_INITIATED',
@@ -293,6 +373,13 @@ export class RefundsService {
       refund.status = RefundStatus.FAILED;
       refund.failureReason = error.response?.message || error.message;
       await refund.save();
+
+      // Release the claim so a retry (manual or scheduled) can attempt the
+      // refund again instead of the payment being stuck "refunded" forever.
+      await this.paymentModel.findByIdAndUpdate(dto.paymentId, {
+        $set: { isRefunded: false, refundedAmount: 0 },
+        $unset: { refundedAt: '' },
+      });
 
       // If it's already an HttpException (like BadRequestException from PaystackService), re-throw it
       if (error.status && error.response) {
