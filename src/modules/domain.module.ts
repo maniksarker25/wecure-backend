@@ -22,6 +22,7 @@ import { RefundsModule } from './refunds/refunds.module';
 import { PayoutsModule } from './payouts/payouts.module';
 import { FirebaseModule } from './firebase/firebase.module';
 import { DashboardModule } from './dashboard/dashboard.module';
+import { BackupsModule } from './backups/backups.module';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
     PayoutsModule,
     FirebaseModule,
     DashboardModule,
+    BackupsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

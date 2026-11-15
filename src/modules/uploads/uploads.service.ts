@@ -8,6 +8,8 @@ import {
   S3Client,
   PutObjectCommand,
   GetObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
@@ -104,5 +106,47 @@ export class UploadsService {
       this.auditLogger.logUpload(userId, fileKey);
     }
     return fileKey;
+  }
+
+  /**
+   * Upload a buffer to an exact, caller-chosen key (no random suffix) —
+   * used for assets like backups that need a predictable, human-readable name.
+   */
+  async uploadBufferAtKey(
+    buffer: Buffer,
+    mimeType: string,
+    key: string,
+  ): Promise<string> {
+    await this.s3.send(
+      new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        Body: buffer,
+        ContentType: mimeType,
+      }),
+    );
+    return key;
+  }
+
+  async listObjects(
+    prefix: string,
+  ): Promise<{ key: string; size?: number; lastModified?: Date }[]> {
+    const result = await this.s3.send(
+      new ListObjectsV2Command({ Bucket: this.bucket, Prefix: prefix }),
+    );
+
+    return (result.Contents || [])
+      .filter((obj) => !!obj.Key)
+      .map((obj) => ({
+        key: obj.Key as string,
+        size: obj.Size,
+        lastModified: obj.LastModified,
+      }));
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    await this.s3.send(
+      new DeleteObjectCommand({ Bucket: this.bucket, Key: key }),
+    );
   }
 }
